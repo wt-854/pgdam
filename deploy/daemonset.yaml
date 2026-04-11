@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pgdam-agent
+  namespace: pgdam
+  labels:
+    app: pgdam-agent
+spec:
+  selector:
+    matchLabels:
+      app: pgdam-agent
+  template:
+    metadata:
+      labels:
+        app: pgdam-agent
+    spec:
+      serviceAccountName: pgdam-agent
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      # 1. eBPF Agent: Captures SQL and sends to Processor UDS
+      - name: agent
+        image: localhost/pgdam-agent:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        env:
+        - name: RUST_LOG
+          value: info
+        volumeMounts:
+        - name: sys-kernel-debug
+          mountPath: /sys/kernel/debug
+          readOnly: true
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+        - name: host-proc
+          mountPath: /proc
+        - name: shared-uds
+          mountPath: /tmp
+      
+      # 2. Processor: Normalizes and Masks SQL via OPA
+      - name: processor
+        image: localhost/pgdam-processor:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: ELASTIC_URL
+          value: "http://elasticsearch.pgdam.svc.cluster.local:9200"
+        - name: ELASTIC_USER
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: username
+        - name: ELASTIC_PASS
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: password
+        volumeMounts:
+        - name: shared-uds
+          mountPath: /tmp
+      
+      # 3. OPA: Sidecar for dynamic policy evaluation
+      - name: opa
+        image: openpolicyagent/opa:latest
+        args:
+        - "run"
+        - "--server"
+        - "--addr=0.0.0.0:8181"
+        - "/policies"
+        volumeMounts:
+        - name: policy-vol
+          mountPath: /policies/mask.rego
+          subPath: mask.rego
+          readOnly: true
+          
+      volumes:
+      - name: sys-kernel-debug
+        hostPath:
+          path: /sys/kernel/debug
+      - name: sys-fs-bpf
+        hostPath:
+          path: /sys/fs/bpf
+      - name: host-proc
+        hostPath:
+          path: /proc
+      - name: shared-uds
+        emptyDir: {}
+      - name: policy-vol
+        configMap:
+          name: pgdam-policies

@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package pgdam.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// AuditEvent represents a captured PostgreSQL database activity.
+// This structure is designed for high-performance transmission from the eBPF agent to the refinery.
+message AuditEvent {
+  // Process ID of the PostgreSQL backend process.
+  int32 pid = 1;
+
+  // Precise timestamp when the activity was captured in kernel-space.
+  google.protobuf.Timestamp timestamp = 2;
+
+  // The raw SQL command captured before normalization.
+  string raw_sql = 3;
+}

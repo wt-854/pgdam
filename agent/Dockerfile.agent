@@ -1,0 +1,18 @@
+FROM debian:bookworm-slim
+
+# Install libssl and other runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the pre-compiled agent binary
+# Note: The eBPF program is embedded in the agent binary via include_bytes!
+COPY target/release/pgdam-agent /app/pgdam-agent
+
+# Ensure permissions
+RUN chmod +x /app/pgdam-agent
+
+ENTRYPOINT ["/app/pgdam-agent"]

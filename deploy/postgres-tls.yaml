@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      initContainers:
+      - name: init-ssl
+        image: busybox
+        command:
+        - sh
+        - -c
+        - |
+          cp /etc/ssl-secret/* /etc/postgresql/ssl/
+          chown 999:999 /etc/postgresql/ssl/*
+          chmod 600 /etc/postgresql/ssl/server.key
+          chmod 644 /etc/postgresql/ssl/server.crt /etc/postgresql/ssl/root.crt
+        volumeMounts:
+        - name: ssl-secret
+          mountPath: /etc/ssl-secret
+        - name: ssl-certs
+          mountPath: /etc/postgresql/ssl
+      containers:
+      - name: postgres
+        image: postgres:latest
+        args:
+        - "-c"
+        - "ssl=on"
+        - "-c"
+        - "ssl_cert_file=/etc/postgresql/ssl/server.crt"
+        - "-c"
+        - "ssl_key_file=/etc/postgresql/ssl/server.key"
+        - "-c"
+        - "ssl_ca_file=/etc/postgresql/ssl/root.crt"
+        env:
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: POSTGRES_DB
+          value: postgres
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: ssl-certs
+          mountPath: /etc/postgresql/ssl
+      volumes:
+      - name: ssl-secret
+        secret:
+          secretName: postgres-tls-secret
+      - name: ssl-certs
+        emptyDir: {}

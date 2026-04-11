@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "pgdam-agent",
+    "pgdam-ebpf",
+    "pgdam-common",
+]
+resolver = "2"

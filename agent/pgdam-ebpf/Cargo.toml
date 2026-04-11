@@ -1,0 +1,12 @@
+[package]
+name = "pgdam-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1.0"
+pgdam-common = { path = "../pgdam-common" }
+
+[[bin]]
+name = "pgdam-ebpf"
+path = "src/main.rs"

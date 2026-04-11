@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-04-10T17:57:31Z",
+  "tool": "pgbench",
+  "configuration": {
+    "clients": 10,
+    "threads": 2,
+    "duration_seconds": 10,
+    "scale_factor": 1
+  },
+  "results": {
+    "transactions_processed": 43325,
+    "failed_transactions": 0,
+    "latency_avg_ms": 2.307,
+    "tps": 4334.276620,
+    "initial_connection_time_ms": 9.469
+  }
+}
