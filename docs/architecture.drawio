@@ -1,0 +1,97 @@
+<mxfile host="65bd71144e">
+    <diagram id="pgdam-arch" name="pgDAM Architecture">
+        <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                
+                <!-- Kubernetes Cluster Boundary -->
+                <mxCell id="cluster-box" value="Kind Cluster: pgdam-dev" style="swimlane;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;fontColor=#333333;strokeColor=#666666;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="40" width="760" height="600" as="geometry"/>
+                </mxCell>
+
+                <!-- Namespace Boundary -->
+                <mxCell id="ns-box" value="Namespace: pgdam" style="swimlane;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="cluster-box">
+                    <mxGeometry x="20" y="40" width="720" height="540" as="geometry"/>
+                </mxCell>
+
+                <!-- DaemonSet Pod -->
+                <mxCell id="pod-box" value="Pod: pgdam-agent (DaemonSet)" style="swimlane;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="ns-box">
+                    <mxGeometry x="20" y="60" width="400" height="440" as="geometry"/>
+                </mxCell>
+
+                <!-- Containers -->
+                <mxCell id="c-agent" value="Agent Container&lt;br&gt;(Rust + eBPF)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="pod-box">
+                    <mxGeometry x="40" y="60" width="120" height="60" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="c-processor" value="Processor Container&lt;br&gt;(Rust)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="pod-box">
+                    <mxGeometry x="240" y="60" width="120" height="60" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="c-opa" value="OPA Container&lt;br&gt;(Sidecar)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="pod-box">
+                    <mxGeometry x="240" y="200" width="120" height="60" as="geometry"/>
+                </mxCell>
+
+                <!-- Volumes -->
+                <mxCell id="v-uds" value="Shared Volume&lt;br&gt;(Unix Domain Socket)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="pod-box">
+                    <mxGeometry x="140" y="150" width="120" height="60" as="geometry"/>
+                </mxCell>
+
+                <!-- Target -->
+                <mxCell id="c-postgres" value="Postgres Deployment&lt;br&gt;(Target)" style="shape=datastore;whiteSpace=wrap;html=1;fillColor=#b0e3e6;strokeColor=#0e8088;" vertex="1" parent="ns-box">
+                    <mxGeometry x="540" y="60" width="120" height="80" as="geometry"/>
+                </mxCell>
+
+                <!-- Infrastructure Sink -->
+                <mxCell id="c-elastic" value="Elasticsearch StatefulSet&lt;br&gt;(Audit Sink)" style="shape=datastore;whiteSpace=wrap;html=1;fillColor=#fad7ac;strokeColor=#b46504;" vertex="1" parent="ns-box">
+                    <mxGeometry x="540" y="300" width="120" height="80" as="geometry"/>
+                </mxCell>
+
+                <!-- ConfigMap -->
+                <mxCell id="cm-policies" value="ConfigMap&lt;br&gt;(mask.rego)" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;darkOpacity=0.05;" vertex="1" parent="ns-box">
+                    <mxGeometry x="550" y="440" width="100" height="60" as="geometry"/>
+                </mxCell>
+
+                <!-- Connections -->
+                <mxCell id="line-ebpf" value="uprobes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="ns-box" source="c-agent" target="c-postgres">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="line-agent-uds" value="Raw SQL" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="pod-box" source="c-agent" target="v-uds">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="100" y="180"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+
+                <mxCell id="line-uds-proc" value="Events" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="pod-box" source="v-uds" target="c-processor">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="300" y="180"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+
+                <mxCell id="line-proc-opa" value="Masking Decision&lt;br&gt;(HTTP 8181)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="pod-box" source="c-processor" target="c-opa">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="line-proc-elastic" value="Audit Telemetry" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="ns-box" source="c-processor" target="c-elastic">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+
+                <mxCell id="line-opa-cm" value="Mount" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;" edge="1" parent="ns-box" source="cm-policies" target="c-opa">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="600" y="530"/>
+                            <mxPoint x="320" y="530"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
