@@ -6,6 +6,8 @@ target
 # Exclude cargo-cache local storage
 .cargo-cache/
 
+# Mac
+.DS_Store
 
 # Exclude scratch
 scratch/
