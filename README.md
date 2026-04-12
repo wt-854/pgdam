@@ -188,12 +188,16 @@ curl -s -u elastic:pgdam-elastic-pass \
 
 ## Repository Structure
 
-/
-├── .github/workflows      # CI/CD pipelines
-├── /agent                 # [Rust Agent] eBPF logic & Uprobes
-├── /processor             # [Processing Engine] AST Parsing & Normalization
-├── /deploy                # [Deployment Agent Workspace]
-│   ├── /configs.yaml      # OPA Policies
-│   └── /daemonset.yaml    # K8s Deployment manifests
-├── /contracts             # Protobuf/JSON schemas
-└── AGENTS.md              # Global "Rules of Engagement"
+```bash
+pgdam/
+├── agent/                 # [Rust] eBPF sensor and userspace collector
+├── processor/             # [Rust] SQL normalization and policy enforcement
+├── policy-engine/         # [Rego] OPA policies for PII detection
+├── dashboard/             # [Frontend] Visualization (Planned)
+├── deploy/                # [K8s] Manifests (DaemonSet, RBAC, Prereqs)
+├── contracts/             # [Schemas] Protobuf and JSON definitions
+├── docs/                  # [Design] Architecture diagrams and documentation
+├── tests/                 # [Testing] Integration and performance tests
+├── AGENTS.md              # [Rules] Project-wide Orchestrator rules
+└── README.md              # [Main] Project overview and setup guide
+```
