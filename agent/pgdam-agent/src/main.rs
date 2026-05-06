@@ -110,13 +110,17 @@ async fn main() -> Result<(), anyhow::Error> {
     let bpf_bytes = include_bytes_aligned!("../../target/bpfel-unknown-none/release/pgdam-ebpf");
     let mut bpf = Bpf::load(bpf_bytes)?;
 
-    let path = discover_postgres_path().expect("Could not find postgres binary");
+    let path = loop {
+        if let Some(p) = discover_postgres_path() {
+            break p;
+        }
+        info!("No Postgres binary found on this node. Retrying in 30 seconds...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    };
     
-    // 1. Look up MyProcPort offset in the binary
     let offset = find_symbol_offset(&path, "MyProcPort").expect("Could not find MyProcPort symbol");
     info!("Found MyProcPort symbol offset: 0x{:x}", offset);
 
-    // 2. Find virtual base address of a running postgres process
     let mut base_addr = 0;
     while base_addr == 0 {
         if let Some(addr) = find_postgres_base_address() {
