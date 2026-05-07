@@ -2,7 +2,7 @@ use std::error::Error;
 use tokio::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt};
+use tokio::io::{BufReader, AsyncBufReadExt};
 use serde::{Deserialize, Serialize};
 use log::{info, error};
 
@@ -58,12 +58,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok((mut stream, _)) => {
                 let sinks_clone = Arc::clone(&sinks);
                 tokio::spawn(async move {
-                    let mut buffer = [0u8; 8192];
+                    let mut reader = tokio::io::BufReader::new(stream);
+                    let mut line = String::new();
                     loop {
-                        match stream.read(&mut buffer).await {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
                             Ok(0) => break,
-                            Ok(n) => {
-                                if let Err(e) = handle_payload(&buffer[..n], &sinks_clone).await {
+                            Ok(_) => {
+                                if let Err(e) = handle_payload(line.as_bytes(), &sinks_clone).await {
                                     error!("Error handling payload: {}", e);
                                 }
                             }

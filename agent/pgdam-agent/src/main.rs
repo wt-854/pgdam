@@ -209,6 +209,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     } else {
                         processor_stream = None;
                     }
+                } else {
+                    // Write newline delimiter after successful write
+                    let _ = stream.write_all(b"\n").await;
                 }
             }
         } else {
