@@ -60,7 +60,7 @@ pub struct SqlEvent {
     pub flags: u32,
     pub timestamp: u64,
     pub payload_len: u32,
-    pub payload: [u8; 128],
+    pub payload: [u8; 512],
     pub user_name: [u8; 64],
     pub database_name: [u8; 64],
     pub remote_host: [u8; 48],
