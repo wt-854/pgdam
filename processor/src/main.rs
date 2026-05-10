@@ -1,21 +1,22 @@
+use log::{error, info};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
-use tokio::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{BufReader, AsyncBufReadExt};
-use serde::{Deserialize, Serialize};
-use log::{info, error};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixListener;
 
-pub mod opa;
 pub mod normalize;
+pub mod opa;
 pub mod sink;
 
-use crate::sink::{Sink, StdoutSink, ElasticSink};
+use crate::sink::{ElasticSink, Sink, StdoutSink};
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ProcessedEvent {
     pub pid: i32,
     pub timestamp: String,
+    pub event_type: String,
     pub user: String,
     pub db: String,
     pub src_ip: String,
@@ -55,17 +56,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         match listener.accept().await {
-            Ok((mut stream, _)) => {
+            Ok((stream, _)) => {
                 let sinks_clone = Arc::clone(&sinks);
                 tokio::spawn(async move {
-                    let mut reader = tokio::io::BufReader::new(stream);
+                    let mut reader = BufReader::new(stream);
                     let mut line = String::new();
                     loop {
                         line.clear();
                         match reader.read_line(&mut line).await {
                             Ok(0) => break,
                             Ok(_) => {
-                                if let Err(e) = handle_payload(line.as_bytes(), &sinks_clone).await {
+                                if let Err(e) = handle_payload(line.as_bytes(), &sinks_clone).await
+                                {
                                     error!("Error handling payload: {}", e);
                                 }
                             }
@@ -90,16 +92,30 @@ async fn handle_payload(data: &[u8], sinks: &[Box<dyn Sink>]) -> Result<(), Box<
     let user = event["user"].as_str().unwrap_or("unknown").to_string();
     let db = event["db"].as_str().unwrap_or("unknown").to_string();
     let src_ip = event["src_ip"].as_str().unwrap_or("unknown").to_string();
+    let event_type = event["event_type"]
+        .as_str()
+        .unwrap_or("user_query")
+        .to_string();
+
+    // Skip processing if the event is incomplete (PID info not yet available)
+    if event_type == "incomplete" {
+        return Ok(());
+    }
 
     // 1. Normalize
     let normalized = normalize::normalize_sql(raw_sql);
 
-    // 2. Mask via OPA
-    let masked = opa::mask_sql_via_opa(raw_sql).await?;
+    // 2. Mask via OPA — skip for background workers, they have no user data
+    let masked = if event_type == "background_worker" {
+        raw_sql.to_string()
+    } else {
+        opa::mask_sql_via_opa(raw_sql).await?
+    };
 
     let processed = ProcessedEvent {
         pid,
         timestamp: ts,
+        event_type,
         user,
         db,
         src_ip,

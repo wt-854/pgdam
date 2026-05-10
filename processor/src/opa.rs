@@ -1,6 +1,6 @@
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use log::{debug, warn};
 
 #[derive(Serialize)]
 struct OpaInput {
@@ -32,30 +32,30 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
     let mut masked_sql = sql.to_string();
 
     // The protobuf representation of the AST allows us to find literals.
-    // However, finding the exact byte offset for replacement in the raw string 
+    // However, finding the exact byte offset for replacement in the raw string
     // is easier if we use the AST locations.
-    
-    // For MVP, let's use a simpler approach: Extract all string literals using regex 
+
+    // For MVP, let's use a simpler approach: Extract all string literals using regex
     // or just pass the whole query to OPA if OPA can identify the sensitive parts.
     // The user said "one policy for credit_card number".
-    
-    // Let's do a high-fidelity approach: 
+
+    // Let's do a high-fidelity approach:
     // OPA can't easily "redact" a string; it typically returns a decision.
     // So we will:
     // 1. Extract potential sensitive strings (simple regex for now or AST walk).
     // 2. Ask OPA for each.
     // 3. Replace in masked_sql.
-    
+
     // Let's use a simple regex to find sequences of 13-16 digits OR quoted strings.
     let re = regex::Regex::new(r"'(.*?)'|\b\d{13,16}\b").unwrap();
-    
+
     // Use a reverse replacement strategy to keep offsets valid
     let mut replacements = Vec::new();
 
     for cap in re.captures_iter(sql) {
         let value = cap.get(0).unwrap().as_str();
         let stripped_value = value.trim_matches('\'');
-        
+
         let query = OpaQuery {
             input: OpaInput {
                 value: stripped_value.to_string(),
@@ -73,7 +73,11 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
                             break;
                         }
                     } else {
-                        warn!("OPA returned error status: {}. Attempt {}/3", resp.status(), attempt + 1);
+                        warn!(
+                            "OPA returned error status: {}. Attempt {}/3",
+                            resp.status(),
+                            attempt + 1
+                        );
                     }
                 }
                 Err(e) => {

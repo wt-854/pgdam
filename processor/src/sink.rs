@@ -1,9 +1,9 @@
-use async_trait::async_trait;
 use crate::ProcessedEvent;
+use async_trait::async_trait;
 use chrono::Utc;
+use log::{error, info};
 use reqwest::Client;
 use serde_json::json;
-use log::{info, error};
 
 #[async_trait]
 pub trait Sink: Send + Sync {
@@ -46,7 +46,7 @@ impl Sink for ElasticSink {
         let user = self.user.clone();
         let pass = self.pass.clone();
         let base_url = self.url.clone();
-        
+
         // Dynamic index based on timestamp
         let index_name = format!("pgdam-audit-{}", Utc::now().format("%Y.%m.%d"));
         let url = format!("{}/{}/_doc", base_url, index_name);
@@ -71,8 +71,14 @@ impl Sink for ElasticSink {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         let status = resp.status();
-                        let body = resp.text().await.unwrap_or_else(|_| "unreadable body".to_string());
-                        error!("Failed to sink to Elastic. Status: {}, Body: {}", status, body);
+                        let body = resp
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "unreadable body".to_string());
+                        error!(
+                            "Failed to sink to Elastic. Status: {}, Body: {}",
+                            status, body
+                        );
                     }
                 }
                 Err(e) => {

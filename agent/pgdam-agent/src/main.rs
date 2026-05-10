@@ -1,4 +1,3 @@
-// pgdam-agent/src/main.rs
 use aya::{
     include_bytes_aligned,
     maps::{HashMap, RingBuf},
@@ -17,9 +16,6 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream, signal};
 
-// SqlEvent is only read from the ring-buffer via raw pointer cast, so it does
-// not need Pod.
-
 const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_PATH: &str = "/tmp/pgdam.sock";
 
@@ -29,6 +25,7 @@ const SOCKET_PATH: &str = "/tmp/pgdam.sock";
 struct AuditEventJson {
     pid: u32,
     timestamp: u64,
+    event_type: String,
     raw_sql: String,
     user: String,
     db: String,
@@ -369,7 +366,7 @@ fn reconcile(
                 continue;
             }
 
-            if exe_path.is_empty() || exe_path.ends_with("(deleted)") {
+            if exe_path.ends_with("(deleted)") {
                 continue;
             }
 
@@ -586,11 +583,13 @@ async fn main() -> Result<(), anyhow::Error> {
             let incomplete = (event.flags & pgdam_common::FLAG_NO_PORT_INFO) != 0;
             let bg_worker = (event.flags & pgdam_common::FLAG_NO_CLIENT) != 0;
 
-            // Background workers have no client connection and no meaningful
-            // user/db context; skip them entirely.
-            if bg_worker {
-                continue;
-            }
+            let event_type = if incomplete {
+                "incomplete"
+            } else if bg_worker {
+                "background_worker"
+            } else {
+                "user_query"
+            }.to_string();
 
             let user = utf8_trim(&event.user_name);
             let db = utf8_trim(&event.database_name);
@@ -599,14 +598,15 @@ async fn main() -> Result<(), anyhow::Error> {
             if incomplete {
                 warn!(
                     "Incomplete event PID {}: sql=\"{}\" \
-                     (PID_INFO race — will resolve after next reconcile)",
+                     (PID_INFO race — context unavailable, event will not be replayed)",
                     event.pid,
                     sql.trim()
                 );
             } else {
                 info!(
-                    "pid={} user={} db={} src={} sql=\"{}\"",
+                    "pid={} type={} user={} db={} src={} sql=\"{}\"",
                     event.pid,
+                    event_type,
                     user,
                     db,
                     src_ip,
@@ -617,6 +617,7 @@ async fn main() -> Result<(), anyhow::Error> {
             let audit = AuditEventJson {
                 pid: event.pid,
                 timestamp: event.timestamp,
+                event_type,
                 raw_sql: sql.to_string(),
                 user: user.to_string(),
                 db: db.to_string(),
