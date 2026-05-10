@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 aya = { version = "0.12", features = ["async_tokio"] }
 aya-log = "0.2"
-pgdam-common = { path = "../pgdam-common" }
+pgdam-common = { path = "../pgdam-common", features = ["userspace"] }
 tokio = { version = "1.25", features = ["full"] }
 anyhow = "1.0"
 env_logger = "0.10"
