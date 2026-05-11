@@ -1,6 +1,11 @@
 FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    librdkafka1 \
+    libsasl2-2 \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY target/release/pgdam-processor /app/pgdam-processor

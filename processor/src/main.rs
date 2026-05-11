@@ -7,15 +7,17 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 
+pub mod config;
 pub mod enrichment;
 pub mod normalize;
 pub mod opa;
 pub mod session;
 pub mod sink;
 
+use crate::config::Config;
 use crate::enrichment::{detect_enricher, Enricher};
 use crate::session::SessionStore;
-use crate::sink::{ElasticSink, Sink, StdoutSink};
+use crate::sink::{ElasticSink, KafkaSink, Sink, StdoutSink};
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ProcessedEvent {
@@ -28,7 +30,6 @@ pub struct ProcessedEvent {
     pub raw_sql: String,
     pub normalized_sql: String,
     pub masked_sql: String,
-    // enrichment fields
     pub hostname: String,
     pub container_id: String,
     pub container_name: String,
@@ -36,7 +37,6 @@ pub struct ProcessedEvent {
     pub k8s_namespace: String,
     pub k8s_node: String,
     pub k8s_labels: HashMap<String, String>,
-    // session/transaction fields
     pub session_id: String,
     pub session_start: String,
     pub transaction_id: String,
@@ -49,24 +49,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     info!("Starting pgdam-processor...");
 
-    let enricher: Arc<Box<dyn Enricher>> = Arc::new(detect_enricher());
-    let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
+    // ── Load config ───────────────────────────────────────────────────────────
+    let config_path =
+        std::env::var("PGDAM_CONFIG").unwrap_or_else(|_| "/etc/pgdam/config.yaml".to_string());
+    let config = Config::load(&config_path)?;
+    info!("Loaded config from {}", config_path);
 
+    // ── Initialize sinks ──────────────────────────────────────────────────────
     let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink)];
 
-    if let (Ok(url), Ok(user), Ok(pass)) = (
-        std::env::var("ELASTIC_URL"),
-        std::env::var("ELASTIC_USER"),
-        std::env::var("ELASTIC_PASS"),
-    ) {
-        info!("Elasticsearch sink enabled: {}", url);
-        sinks.push(Box::new(ElasticSink::new(url, user, pass)));
-    } else {
-        info!("Elasticsearch sink disabled (missing configuration)");
+    if let Some(es_config) = &config.sinks.elasticsearch {
+        if es_config.enabled {
+            for instance in &es_config.instances {
+                if !instance.enabled {
+                    info!(
+                        "Elasticsearch instance '{}' is disabled — skipping",
+                        instance.name
+                    );
+                    continue;
+                }
+                let user = instance.resolve_username();
+                let pass = instance.resolve_password();
+                info!(
+                    "Elasticsearch sink enabled: {} ({})",
+                    instance.name, instance.url
+                );
+                sinks.push(Box::new(ElasticSink::new(
+                    instance.name.clone(),
+                    instance.url.clone(),
+                    user,
+                    pass,
+                )));
+            }
+        } else {
+            info!("Elasticsearch sink disabled");
+        }
     }
 
-    let sinks = Arc::new(sinks);
+    if let Some(kafka_config) = &config.sinks.kafka {
+        if kafka_config.enabled {
+            for instance in &kafka_config.instances {
+                if !instance.enabled {
+                    info!("Kafka instance '{}' is disabled — skipping", instance.name);
+                    continue;
+                }
+                match KafkaSink::new(instance) {
+                    Ok(sink) => {
+                        info!("Kafka sink enabled: {}", instance.name);
+                        sinks.push(Box::new(sink));
+                    }
+                    Err(e) => error!("Failed to create Kafka sink '{}': {}", instance.name, e),
+                }
+            }
+        } else {
+            info!("Kafka sink disabled");
+        }
+    }
 
+    let sinks: Arc<Vec<Box<dyn Sink>>> = Arc::new(sinks);
+    let enricher: Arc<dyn Enricher> = Arc::from(detect_enricher());
+    let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
+
+    // ── Unix socket ───────────────────────────────────────────────────────────
     let socket_path = "/tmp/pgdam.sock";
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
@@ -92,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 if let Err(e) = handle_payload(
                                     line.as_bytes(),
                                     &sinks_clone,
-                                    &enricher_clone,
+                                    enricher_clone.as_ref(),
                                     &session_store_clone,
                                 )
                                 .await
@@ -116,7 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn handle_payload(
     data: &[u8],
     sinks: &[Box<dyn Sink>],
-    enricher: &Box<dyn Enricher>,
+    enricher: &dyn Enricher,
     session_store: &SessionStore,
 ) -> Result<(), Box<dyn Error>> {
     let event: serde_json::Value = serde_json::from_slice(data)?;
@@ -136,7 +180,7 @@ async fn handle_payload(
         return Ok(());
     }
 
-    // 1. Enrich with environment metadata
+    // 1. Enrich
     let enrichment = enricher.enrich(pid as u32).await.unwrap_or_default();
 
     // 2. Session and transaction tracking
@@ -176,7 +220,6 @@ async fn handle_payload(
         query_sequence: query_ctx.query_sequence,
     };
 
-    // 5. Dispatch to all active sinks
     for sink in sinks {
         sink.send(processed.clone()).await;
     }

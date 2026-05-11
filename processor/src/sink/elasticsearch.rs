@@ -1,3 +1,4 @@
+use crate::sink::Sink;
 use crate::ProcessedEvent;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -5,33 +6,19 @@ use log::error;
 use reqwest::Client;
 use serde_json::json;
 
-#[async_trait]
-pub trait Sink: Send + Sync {
-    async fn send(&self, event: ProcessedEvent);
-}
-
-pub struct StdoutSink;
-
-#[async_trait]
-impl Sink for StdoutSink {
-    async fn send(&self, event: ProcessedEvent) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            println!("{}", json);
-        }
-    }
-}
-
 pub struct ElasticSink {
     client: Client,
+    name: String,
     url: String,
     user: String,
     pass: String,
 }
 
 impl ElasticSink {
-    pub fn new(url: String, user: String, pass: String) -> Self {
+    pub fn new(name: String, url: String, user: String, pass: String) -> Self {
         Self {
             client: Client::new(),
+            name,
             url,
             user,
             pass,
@@ -43,19 +30,18 @@ impl ElasticSink {
 impl Sink for ElasticSink {
     async fn send(&self, event: ProcessedEvent) {
         let client = self.client.clone();
+        let name = self.name.clone();
         let user = self.user.clone();
         let pass = self.pass.clone();
         let base_url = self.url.clone();
 
-        // Dynamic index based on timestamp
         let index_name = format!("pgdam-audit-{}", Utc::now().format("%Y.%m.%d"));
         let url = format!("{}/{}/_doc", base_url, index_name);
 
-        // Fire and forget: spawn a task to avoid blocking the main processing loop
         tokio::spawn(async move {
             let res = client
-                .post(url)
-                .basic_auth(user, Some(pass))
+                .post(&url)
+                .basic_auth(&user, Some(&pass))
                 .json(&json!({
                     "pid":               event.pid,
                     "timestamp":         event.timestamp,
@@ -90,12 +76,15 @@ impl Sink for ElasticSink {
                             .await
                             .unwrap_or_else(|_| "unreadable body".to_string());
                         error!(
-                            "Failed to sink to Elastic. Status: {}, Body: {}",
-                            status, body
+                            "[{}] Failed to sink to Elastic. Status: {}, Body: {}",
+                            name, status, body
                         );
                     }
                 }
-                Err(e) => error!("Connection error while sinking to Elastic: {}", e),
+                Err(e) => error!(
+                    "[{}] Connection error while sinking to Elastic: {}",
+                    name, e
+                ),
             }
         });
     }

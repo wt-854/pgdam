@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     clang \
     libclang-dev \
+    libsasl2-dev \
+    librdkafka-dev \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup toolchain install nightly && \
