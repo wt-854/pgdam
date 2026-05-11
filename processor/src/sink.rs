@@ -57,12 +57,26 @@ impl Sink for ElasticSink {
                 .post(url)
                 .basic_auth(user, Some(pass))
                 .json(&json!({
-                    "pid": event.pid,
-                    "timestamp": event.timestamp,
-                    "user": event.user,
-                    "db": event.db,
-                    "src_ip": event.src_ip,
-                    "normalized_sql": event.normalized_sql
+                    "pid":               event.pid,
+                    "timestamp":         event.timestamp,
+                    "event_type":        event.event_type,
+                    "user":              event.user,
+                    "db":                event.db,
+                    "src_ip":            event.src_ip,
+                    "normalized_sql":    event.normalized_sql,
+                    "masked_sql":        event.masked_sql,
+                    "hostname":          event.hostname,
+                    "container_id":      event.container_id,
+                    "container_name":    event.container_name,
+                    "k8s_pod":           event.k8s_pod,
+                    "k8s_namespace":     event.k8s_namespace,
+                    "k8s_node":          event.k8s_node,
+                    "k8s_labels":        event.k8s_labels,
+                    "session_id":        event.session_id,
+                    "session_start":     event.session_start,
+                    "transaction_id":    event.transaction_id,
+                    "transaction_state": event.transaction_state,
+                    "query_sequence":    event.query_sequence,
                 }))
                 .send()
                 .await;
@@ -81,9 +95,7 @@ impl Sink for ElasticSink {
                         );
                     }
                 }
-                Err(e) => {
-                    error!("Connection error while sinking to Elastic: {}", e);
-                }
+                Err(e) => error!("Connection error while sinking to Elastic: {}", e),
             }
         });
     }

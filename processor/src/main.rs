@@ -10,9 +10,11 @@ use tokio::net::UnixListener;
 pub mod enrichment;
 pub mod normalize;
 pub mod opa;
+pub mod session;
 pub mod sink;
 
 use crate::enrichment::{detect_enricher, Enricher};
+use crate::session::SessionStore;
 use crate::sink::{ElasticSink, Sink, StdoutSink};
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
@@ -34,6 +36,12 @@ pub struct ProcessedEvent {
     pub k8s_namespace: String,
     pub k8s_node: String,
     pub k8s_labels: HashMap<String, String>,
+    // session/transaction fields
+    pub session_id: String,
+    pub session_start: String,
+    pub transaction_id: String,
+    pub transaction_state: String,
+    pub query_sequence: u64,
 }
 
 #[tokio::main]
@@ -42,6 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Starting pgdam-processor...");
 
     let enricher: Arc<Box<dyn Enricher>> = Arc::new(detect_enricher());
+    let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
 
     let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink)];
 
@@ -71,6 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok((stream, _)) => {
                 let sinks_clone = Arc::clone(&sinks);
                 let enricher_clone = Arc::clone(&enricher);
+                let session_store_clone = Arc::clone(&session_store);
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
@@ -79,9 +89,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         match reader.read_line(&mut line).await {
                             Ok(0) => break,
                             Ok(_) => {
-                                if let Err(e) =
-                                    handle_payload(line.as_bytes(), &sinks_clone, &enricher_clone)
-                                        .await
+                                if let Err(e) = handle_payload(
+                                    line.as_bytes(),
+                                    &sinks_clone,
+                                    &enricher_clone,
+                                    &session_store_clone,
+                                )
+                                .await
                                 {
                                     error!("Error handling payload: {}", e);
                                 }
@@ -103,12 +117,13 @@ async fn handle_payload(
     data: &[u8],
     sinks: &[Box<dyn Sink>],
     enricher: &Box<dyn Enricher>,
+    session_store: &SessionStore,
 ) -> Result<(), Box<dyn Error>> {
     let event: serde_json::Value = serde_json::from_slice(data)?;
 
     let raw_sql = event["raw_sql"].as_str().unwrap_or("");
     let pid = event["pid"].as_i64().unwrap_or(0) as i32;
-    let ts = event["timestamp"].as_u64().unwrap_or(0).to_string();
+    let ts = event["timestamp"].as_u64().unwrap_or(0);
     let user = event["user"].as_str().unwrap_or("").to_string();
     let db = event["db"].as_str().unwrap_or("").to_string();
     let src_ip = event["src_ip"].as_str().unwrap_or("").to_string();
@@ -124,10 +139,13 @@ async fn handle_payload(
     // 1. Enrich with environment metadata
     let enrichment = enricher.enrich(pid as u32).await.unwrap_or_default();
 
-    // 2. Normalize
+    // 2. Session and transaction tracking
+    let query_ctx = session_store.process(pid as u32, ts, raw_sql).await;
+
+    // 3. Normalize
     let normalized = normalize::normalize_sql(raw_sql);
 
-    // 3. Mask via OPA — skip for background workers
+    // 4. Mask via OPA — skip for background workers
     let masked = if event_type == "background_worker" {
         raw_sql.to_string()
     } else {
@@ -136,7 +154,7 @@ async fn handle_payload(
 
     let processed = ProcessedEvent {
         pid,
-        timestamp: ts,
+        timestamp: ts.to_string(),
         event_type,
         user,
         db,
@@ -151,9 +169,14 @@ async fn handle_payload(
         k8s_namespace: enrichment.k8s_namespace,
         k8s_node: enrichment.k8s_node,
         k8s_labels: enrichment.k8s_labels,
+        session_id: query_ctx.session_id,
+        session_start: query_ctx.session_start.to_string(),
+        transaction_id: query_ctx.transaction_id,
+        transaction_state: query_ctx.transaction_state,
+        query_sequence: query_ctx.query_sequence,
     };
 
-    // 4. Dispatch to all active sinks
+    // 5. Dispatch to all active sinks
     for sink in sinks {
         sink.send(processed.clone()).await;
     }
