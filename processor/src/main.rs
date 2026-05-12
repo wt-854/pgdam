@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 
 pub mod config;
 pub mod enrichment;
+pub mod metrics;
 pub mod normalize;
 pub mod opa;
 pub mod session;
@@ -18,6 +20,8 @@ use crate::config::Config;
 use crate::enrichment::{detect_enricher, Enricher};
 use crate::session::SessionStore;
 use crate::sink::{ElasticSink, KafkaSink, Sink, StdoutSink};
+
+const METRICS_PORT: u16 = 9091;
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ProcessedEvent {
@@ -48,6 +52,10 @@ pub struct ProcessedEvent {
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     info!("Starting pgdam-processor...");
+
+    // Start metrics server in background.
+    tokio::spawn(metrics::start_metrics_server(METRICS_PORT));
+    metrics::init_metrics();
 
     // ── Load config ───────────────────────────────────────────────────────────
     let config_path =
@@ -109,6 +117,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sinks: Arc<Vec<Box<dyn Sink>>> = Arc::new(sinks);
     let enricher: Arc<dyn Enricher> = Arc::from(detect_enricher());
     let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
+
+    // Periodically update session store size metric.
+    let session_store_for_metrics = Arc::clone(&session_store);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let size = session_store_for_metrics.len().await;
+            metrics::SESSION_STORE_SIZE.set(size as i64);
+        }
+    });
 
     // ── Unix socket ───────────────────────────────────────────────────────────
     let socket_path = "/tmp/pgdam.sock";
@@ -180,8 +198,14 @@ async fn handle_payload(
         return Ok(());
     }
 
+    metrics::EVENTS_PROCESSED_TOTAL
+        .with_label_values(&[&event_type])
+        .inc();
+
     // 1. Enrich
+    let enrich_start = std::time::Instant::now();
     let enrichment = enricher.enrich(pid as u32).await.unwrap_or_default();
+    metrics::ENRICHMENT_LATENCY.observe(enrich_start.elapsed().as_secs_f64());
 
     // 2. Session and transaction tracking
     let query_ctx = session_store.process(pid as u32, ts, raw_sql).await;
@@ -193,7 +217,10 @@ async fn handle_payload(
     let masked = if event_type == "background_worker" {
         raw_sql.to_string()
     } else {
-        opa::mask_sql_via_opa(raw_sql).await?
+        let opa_start = std::time::Instant::now();
+        let result = opa::mask_sql_via_opa(raw_sql).await?;
+        metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
+        result
     };
 
     let processed = ProcessedEvent {

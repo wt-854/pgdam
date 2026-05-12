@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::sink::Sink;
 use crate::ProcessedEvent;
 use async_trait::async_trait;
@@ -16,6 +17,14 @@ pub struct ElasticSink {
 
 impl ElasticSink {
     pub fn new(name: String, url: String, user: String, pass: String) -> Self {
+
+        metrics::ELASTICSEARCH_ERRORS_TOTAL
+            .with_label_values(&[&name])
+            .reset();
+        metrics::SINK_LATENCY
+            .with_label_values(&["elasticsearch", &name])
+            .observe(0.0);
+
         Self {
             client: Client::new(),
             name,
@@ -39,6 +48,7 @@ impl Sink for ElasticSink {
         let url = format!("{}/{}/_doc", base_url, index_name);
 
         tokio::spawn(async move {
+            let start = std::time::Instant::now();
             let res = client
                 .post(&url)
                 .basic_auth(&user, Some(&pass))
@@ -69,7 +79,13 @@ impl Sink for ElasticSink {
 
             match res {
                 Ok(resp) => {
+                    metrics::SINK_LATENCY
+                        .with_label_values(&["elasticsearch", &name])
+                        .observe(start.elapsed().as_secs_f64());
                     if !resp.status().is_success() {
+                        metrics::ELASTICSEARCH_ERRORS_TOTAL
+                            .with_label_values(&[&name])
+                            .inc();
                         let status = resp.status();
                         let body = resp
                             .text()
@@ -81,10 +97,15 @@ impl Sink for ElasticSink {
                         );
                     }
                 }
-                Err(e) => error!(
-                    "[{}] Connection error while sinking to Elastic: {}",
-                    name, e
-                ),
+                Err(e) => {
+                    metrics::ELASTICSEARCH_ERRORS_TOTAL
+                        .with_label_values(&[&name])
+                        .inc();
+                    error!(
+                        "[{}] Connection error while sinking to Elastic: {}",
+                        name, e
+                    );
+                }
             }
         });
     }

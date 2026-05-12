@@ -1,3 +1,4 @@
+use crate::metrics;
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -65,8 +66,10 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
 
         let mut opa_res_matched = false;
         for attempt in 0..3 {
+            let opa_start = std::time::Instant::now();
             match client.post(opa_url).json(&query).send().await {
                 Ok(resp) => {
+                    metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
                     if resp.status().is_success() {
                         if let Ok(opa_res) = resp.json::<OpaResponse>().await {
                             opa_res_matched = opa_res.result;

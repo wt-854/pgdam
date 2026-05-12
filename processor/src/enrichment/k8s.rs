@@ -1,4 +1,5 @@
 use super::{Enricher, EnrichmentContext};
+use crate::metrics;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
@@ -42,6 +43,7 @@ impl K8sEnricher {
         let pods: Api<Pod> = Api::all(client.clone());
         let lp = ListParams::default().fields(&format!("spec.nodeName={}", self.node_name));
 
+        let start = std::time::Instant::now();
         let pod_list = match pods.list(&lp).await {
             Ok(l) => l,
             Err(e) => {
@@ -49,6 +51,7 @@ impl K8sEnricher {
                 return None;
             }
         };
+        metrics::ENRICHMENT_LATENCY.observe(start.elapsed().as_secs_f64());
 
         for pod in pod_list.items {
             let statuses = pod
@@ -103,6 +106,7 @@ impl Enricher for K8sEnricher {
             let cache = self.cache.lock().await;
             if let Some(entry) = cache.get(&pid) {
                 if entry.inserted_at.elapsed() < CACHE_TTL {
+                    metrics::ENRICHMENT_CACHE_HITS_TOTAL.inc();
                     return Some(entry.context.clone());
                 }
             }

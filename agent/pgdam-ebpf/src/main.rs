@@ -7,9 +7,8 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint, uprobe},
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
-    EbpfContext,
 };
 use pgdam_common::{BinaryConfig, PidInfo, SqlEvent};
 
@@ -25,19 +24,15 @@ static mut WATCHED_PARENTS: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 #[map]
 static mut NEW_PIDS: RingBuf = RingBuf::with_byte_size(4096, 0);
 
+// Ring buffer for SQL events. Set to 64 MB as a baseline for high query volumes
+// Tune upward if pgdam_events_dropped_total increments under load.
 #[map]
-static mut EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+static mut EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024 * 1024, 0);
 
-// sched_process_fork tracepoint memory layout:
-// offset  0–7  : common header
-// offset  8–23 : parent_comm[16]
-// offset 24–27 : parent_pid
-// offset 28–43 : child_comm[16]
-// offset 44–47 : child_pid
-//
-// We use ctx.read_at::<u32>(offset) instead of a struct cast because
-// read_at copies the value onto the BPF stack. The verifier requires map
-// keys to live in stack memory (fp), not derived from the ctx pointer.
+// Single-entry counter incremented when EVENTS ring buffer is full.
+// Read periodically by the agent and exposed as a Prometheus metric.
+#[map]
+static mut DROPPED_EVENTS: Array<u32> = Array::with_max_entries(1, 0);
 
 #[tracepoint(name = "on_fork", category = "sched")]
 pub fn on_fork(ctx: TracePointContext) -> i64 {
@@ -80,7 +75,20 @@ fn try_pg_parse_query(ctx: ProbeContext) -> Result<u32, i64> {
     let pid: u32 = (bpf_get_current_pid_tgid() >> 32) as u32;
     let query_ptr: *const u8 = ctx.arg(0).ok_or(0i64)?;
 
-    let mut event = unsafe { EVENTS.reserve::<SqlEvent>(0) }.ok_or(0i64)?;
+    // Reserve ring buffer space. If the buffer is full, increment the drop
+    // counter and return — the event is lost but we have visibility into it.
+    let mut event = match unsafe { EVENTS.reserve::<SqlEvent>(0) } {
+        Some(e) => e,
+        None => {
+            unsafe {
+                if let Some(ptr) = DROPPED_EVENTS.get_ptr_mut(0) {
+                    *ptr += 1;
+                }
+            }
+            return Ok(0);
+        }
+    };
+
     let ep = event.as_mut_ptr();
 
     unsafe {

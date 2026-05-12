@@ -1,6 +1,6 @@
 use aya::{
     include_bytes_aligned,
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::{TracePoint, UProbe},
     Bpf,
 };
@@ -16,10 +16,12 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream, signal};
 
-const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const SOCKET_PATH: &str = "/tmp/pgdam.sock";
+mod metrics;
 
-// ── Serialisable audit record ─────────────────────────────────────────────────
+const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DROP_READ_INTERVAL: Duration = Duration::from_secs(10);
+const SOCKET_PATH: &str = "/tmp/pgdam.sock";
+const METRICS_PORT: u16 = 9090;
 
 #[derive(Serialize)]
 struct AuditEventJson {
@@ -121,8 +123,7 @@ fn port_field_offsets(major: u32) -> (u32, u32, u32) {
         16 | 17 | 18 => (288, 384, 392),
         _ => {
             warn!(
-                "Unknown PG major version {}; falling back to PG18 Port offsets. \
-                 Consider adding an entry to port_field_offsets().",
+                "Unknown PG major version {}; falling back to PG18 Port offsets.",
                 major
             );
             (288, 384, 392)
@@ -436,6 +437,11 @@ async fn main() -> Result<(), anyhow::Error> {
     env_logger::init();
     info!("Starting pgdam-agent (multi-binary mode)...");
 
+    // Start metrics server in background.
+    tokio::spawn(metrics::start_metrics_server(METRICS_PORT));
+
+    metrics::init_metrics();
+
     let bpf_bytes = include_bytes_aligned!("../../target/bpfel-unknown-none/release/pgdam-ebpf");
     let mut bpf = Bpf::load(bpf_bytes)?;
 
@@ -452,6 +458,7 @@ async fn main() -> Result<(), anyhow::Error> {
         HashMap::try_from(bpf.take_map("WATCHED_PARENTS").unwrap())?;
     let mut new_pids_buf: RingBuf<_> = RingBuf::try_from(bpf.take_map("NEW_PIDS").unwrap())?;
     let mut ring_buf: RingBuf<_> = RingBuf::try_from(bpf.take_map("EVENTS").unwrap())?;
+    let mut drop_map: Array<_, u32> = Array::try_from(bpf.take_map("DROPPED_EVENTS").unwrap())?;
 
     // ── Load programs ─────────────────────────────────────────────────────────
     // Programs are loaded in isolated blocks so the &mut Bpf borrow ends before
@@ -496,6 +503,8 @@ async fn main() -> Result<(), anyhow::Error> {
             for (inode, profile) in &known_binaries {
                 info!("  inode={} path={}", inode, profile.path);
             }
+            metrics::PID_MAP_SIZE.set(known_pids.len() as i64);
+            metrics::BINARY_COUNT.set(known_binaries.len() as i64);
             break;
         }
         info!("No Postgres processes found yet. Retrying in 2 s...");
@@ -505,6 +514,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // ── Connect to processor ──────────────────────────────────────────────────
     let mut processor_stream = connect_to_processor().await;
     let mut last_refresh = tokio::time::Instant::now();
+    let mut last_drop_read = tokio::time::Instant::now();
+    let mut last_drop_count: u32 = 0;
 
     // ── Event loop ────────────────────────────────────────────────────────────
     loop {
@@ -567,13 +578,34 @@ async fn main() -> Result<(), anyhow::Error> {
                             known_binaries.len()
                         );
                     }
+                    metrics::PID_MAP_SIZE.set(known_pids.len() as i64);
+                    metrics::BINARY_COUNT.set(known_binaries.len() as i64);
                 }
                 Err(e) => error!("Reconcile error: {}", e),
             }
             last_refresh = tokio::time::Instant::now();
         }
 
-        // -- SQL event processing ─────────────────────────────────────────────
+        // ── Periodic drop counter read ────────────────────────────────────────
+        if last_drop_read.elapsed() >= DROP_READ_INTERVAL {
+            if let Ok(current) = drop_map.get(&0, 0) {
+                if current > last_drop_count {
+                    let delta = current - last_drop_count;
+                    metrics::EVENTS_DROPPED_TOTAL.inc_by(delta as u64);
+                    if delta > 0 {
+                        warn!(
+                            "Ring buffer overflow: {} events dropped in last {}s",
+                            delta,
+                            DROP_READ_INTERVAL.as_secs()
+                        );
+                    }
+                    last_drop_count = current;
+                }
+            }
+            last_drop_read = tokio::time::Instant::now();
+        }
+
+        // ── SQL event processing ──────────────────────────────────────────────
         if let Some(item) = ring_buf.next() {
             let event = unsafe { &*(item.as_ptr() as *const SqlEvent) };
 
@@ -589,7 +621,16 @@ async fn main() -> Result<(), anyhow::Error> {
                 "background_worker"
             } else {
                 "user_query"
-            }.to_string();
+            }
+            .to_string();
+
+            metrics::EVENTS_CAPTURED_TOTAL.inc();
+            if incomplete {
+                metrics::INCOMPLETE_EVENTS_TOTAL.inc();
+            }
+            if bg_worker {
+                metrics::BG_WORKER_EVENTS_TOTAL.inc();
+            }
 
             let user = utf8_trim(&event.user_name);
             let db = utf8_trim(&event.database_name);

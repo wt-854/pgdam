@@ -1,4 +1,5 @@
 use crate::config::{AuthMechanism, KafkaInstance};
+use crate::metrics;
 use crate::sink::Sink;
 use crate::ProcessedEvent;
 use async_trait::async_trait;
@@ -71,6 +72,18 @@ impl KafkaSink {
             instance.brokers_string()
         );
 
+        metrics::SINK_LATENCY
+            .with_label_values(&["kafka", &instance.name])
+            .observe(0.0);
+
+        for (_, topics) in &instance.topics {
+            for topic in topics {
+                metrics::KAFKA_ERRORS_TOTAL
+                    .with_label_values(&[&instance.name, topic])
+                    .reset();
+            }
+        }
+
         Ok(Self {
             name: instance.name.clone(),
             producer,
@@ -111,8 +124,12 @@ impl Sink for KafkaSink {
                 .payload(payload.as_str())
                 .key(key.as_str());
 
+            let start = std::time::Instant::now();
             match self.producer.send(record, Duration::from_secs(5)).await {
                 Ok((partition, offset)) => {
+                    metrics::SINK_LATENCY
+                        .with_label_values(&["kafka", &self.name])
+                        .observe(start.elapsed().as_secs_f64());
                     log::debug!(
                         "[{}] Sent to {} partition={} offset={}",
                         self.name,
@@ -122,6 +139,9 @@ impl Sink for KafkaSink {
                     );
                 }
                 Err((e, _)) => {
+                    metrics::KAFKA_ERRORS_TOTAL
+                        .with_label_values(&[&self.name, topic])
+                        .inc();
                     error!("[{}] Failed to send to topic {}: {}", self.name, topic, e);
                 }
             }

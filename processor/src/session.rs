@@ -50,6 +50,10 @@ impl SessionStore {
         }
     }
 
+    pub async fn len(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     pub async fn process(&self, pid: u32, timestamp: u64, sql: &str) -> QueryContext {
         let mut sessions = self.sessions.lock().await;
 
