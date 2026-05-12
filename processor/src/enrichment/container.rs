@@ -3,25 +3,34 @@ use async_trait::async_trait;
 use hostname;
 use log::warn;
 
-/// Reads /proc/<pid>/cgroup and extracts the container ID.
-/// Works for Docker, containerd, and podman — they all write the
-/// container ID into the cgroup path.
 pub fn read_container_id(pid: u32) -> Option<String> {
     let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+
     for line in cgroup.lines() {
-        // cgroup v2: single line "0::/..." with container ID embedded
-        // cgroup v1: multiple lines, container ID in the path
-        // Container IDs are 64-char hex strings
+        // cgroup v2 containerd format:
+        // 0::/../../kubepods-*.slice/cri-containerd-<ID>.scope
+        if let Some(rest) = line.split("cri-containerd-").nth(1) {
+            if let Some(id) = rest.split('.').next() {
+                if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+
+        // cgroup v2 docker format:
+        // 0::/../../kubepods-*.slice/docker-<ID>.scope
+        if let Some(rest) = line.split("docker-").nth(1) {
+            if let Some(id) = rest.split('.').next() {
+                if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+
+        // cgroup v1 fallback — container ID as a 64-char path segment
         if let Some(id) = line
             .split('/')
             .find(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
-        {
-            return Some(id.to_string());
-        }
-        // containerd uses a shorter 12-char prefix sometimes — also check for that
-        if let Some(id) = line
-            .split('/')
-            .find(|s| s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit()))
         {
             return Some(id.to_string());
         }
