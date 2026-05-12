@@ -21,26 +21,28 @@ struct CacheEntry {
 
 pub struct K8sEnricher {
     node_name: String,
+    client: Client,
     /// pid → EnrichmentContext cache to avoid hammering the K8s API
     cache: Arc<Mutex<HashMap<u32, CacheEntry>>>,
 }
 
 impl K8sEnricher {
-    pub fn new(node_name: String) -> Self {
-        Self {
+    pub async fn new(node_name: String) -> Result<Self, kube::Error> {
+        let client = Client::try_default().await?;
+        Ok(Self {
             node_name,
+            client,
             cache: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
-    /// Read the container ID from /proc/<pid>/cgroup.
     fn container_id_for(pid: u32) -> Option<String> {
         crate::enrichment::container::read_container_id(pid)
     }
 
     /// Query the K8s API for the pod running this container on this node.
-    async fn lookup_pod(&self, client: &Client, container_id: &str) -> Option<EnrichmentContext> {
-        let pods: Api<Pod> = Api::all(client.clone());
+    async fn lookup_pod(&self, container_id: &str) -> Option<EnrichmentContext> {
+        let pods: Api<Pod> = Api::all(self.client.clone());
         let lp = ListParams::default().fields(&format!("spec.nodeName={}", self.node_name));
 
         let start = std::time::Instant::now();
@@ -124,20 +126,8 @@ impl Enricher for K8sEnricher {
             }
         };
 
-        let client = match Client::try_default().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Could not create K8s client: {}", e);
-                return Some(EnrichmentContext {
-                    hostname: self.node_name.clone(),
-                    container_id: container_id.clone(),
-                    ..Default::default()
-                });
-            }
-        };
-
         let ctx = self
-            .lookup_pod(&client, &container_id)
+            .lookup_pod(&container_id)
             .await
             .unwrap_or_else(|| EnrichmentContext {
                 hostname: self.node_name.clone(),

@@ -33,6 +33,7 @@ struct AuditEventJson {
     db: String,
     src_ip: String,
     incomplete: bool,
+    truncated: bool,
 }
 
 // ── Per-binary profile ────────────────────────────────────────────────────────
@@ -296,7 +297,7 @@ fn attach_new_binary(
 
     let uprobe: &mut UProbe = bpf
         .program_mut("pg_pg_parse_query")
-        .ok_or_else(|| anyhow::anyhow!("uprobe program not found in eBPF object"))?
+        .ok_or_else(|| anyhow::anyhow!("uprobe program not found"))?
         .try_into()?;
 
     // attach() on an already-loaded UProbe adds another probe point without
@@ -312,20 +313,9 @@ fn attach_new_binary(
     Ok(())
 }
 
-// ── Reconciliation ────────────────────────────────────────────────────────────
-
-/// Reconcile agent state against the live /proc snapshot:
-///
-///  1. For every process whose binary inode has not been seen before:
-///     analyse the binary, attach a new uprobe, write BINARY_CONFIGS.
-///
-///  2. For every process not yet in known_pids:
-///     write PID_INFO and add to WATCHED_PARENTS.
-///
-///  3. For every PID in known_pids that no longer exists in /proc:
-///     remove from PID_INFO and known_pids.
-///
-/// Returns (pids_added, pids_removed, binaries_added).
+/// Reconcile agent state against the live /proc snapshot.
+/// Returns (pids_added, pids_removed, binaries_added, stale_pids).
+/// stale_pids is returned so the caller can emit pid_exit events.
 fn reconcile(
     bpf: &mut Bpf,
     binary_configs: &mut HashMap<aya::maps::MapData, u64, BinaryConfig>,
@@ -333,7 +323,7 @@ fn reconcile(
     watched_parents: &mut HashMap<aya::maps::MapData, u32, u8>,
     known_binaries: &mut StdHashMap<u64, BinaryProfile>,
     known_pids: &mut HashSet<u32>,
-) -> anyhow::Result<(usize, usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize, Vec<u32>)> {
     let live = scan_postgres_processes();
     let live_pid_set: HashSet<u32> = live.iter().map(|p| p.pid).collect();
 
@@ -349,13 +339,8 @@ fn reconcile(
         if let Err(e) = pid_info_map.remove(pid) {
             error!("Failed to remove stale PID {} from PID_INFO: {}", pid, e);
         }
-        // WATCHED_PARENTS is not cleaned up here intentionally: the fork
-        // tracepoint silently discards events for unknown child PIDs, so
-        // leaving stale entries only wastes a tiny amount of map space and
-        // avoids a second map syscall per removed PID.
     }
 
-    // ── Register new binaries and PIDs ────────────────────────────────────────
     let mut pids_added = 0usize;
     let mut binaries_added = 0usize;
 
@@ -399,7 +384,7 @@ fn reconcile(
         }
     }
 
-    Ok((pids_added, removed, binaries_added))
+    Ok((pids_added, removed, binaries_added, stale))
 }
 
 // ── Processor socket helpers ──────────────────────────────────────────────────
@@ -424,13 +409,15 @@ async fn connect_to_processor() -> Option<UnixStream> {
     None
 }
 
-// ── Utility ───────────────────────────────────────────────────────────────────
+async fn send_event(stream: &mut UnixStream, payload: &[u8]) -> bool {
+    let mut data = payload.to_vec();
+    data.push(b'\n');
+    stream.write_all(&data).await.is_ok()
+}
 
 fn utf8_trim(buf: &[u8]) -> &str {
     std::str::from_utf8(buf).unwrap_or("").trim_matches('\0')
 }
-
-// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -485,7 +472,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Block until at least one postgres process is visible.  This handles the
     // case where the agent starts before any postgres container is scheduled.
     loop {
-        let (added, _removed, _new_bins) = reconcile(
+        let (added, _removed, _new_bins, _) = reconcile(
             &mut bpf,
             &mut binary_configs,
             &mut pid_info_map,
@@ -554,9 +541,7 @@ async fn main() -> Result<(), anyhow::Error> {
             // If /proc/<child> isn't ready yet, reconcile() picks it up.
         }
 
-        // -- Periodic reconciliation ─────────────────────────────────────────
-        // Catches new containers/binaries that started since the last tick,
-        // removes PIDs that exited, and attaches probes to new binary images.
+        // ── Periodic reconciliation ───────────────────────────────────────────
         if last_refresh.elapsed() >= PID_REFRESH_INTERVAL {
             match reconcile(
                 &mut bpf,
@@ -566,7 +551,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 &mut known_binaries,
                 &mut known_pids,
             ) {
-                Ok((added, removed, new_bins)) => {
+                Ok((added, removed, new_bins, stale_pids)) => {
                     if added > 0 || removed > 0 || new_bins > 0 {
                         info!(
                             "Reconcile: +{} PIDs  -{} PIDs  +{} binary images  \
@@ -580,6 +565,24 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                     metrics::PID_MAP_SIZE.set(known_pids.len() as i64);
                     metrics::BINARY_COUNT.set(known_binaries.len() as i64);
+
+                    // Emit pid_exit for each stale PID so the processor can
+                    // clean up session state for that connection.
+                    if let Some(ref mut stream) = processor_stream {
+                        for pid in stale_pids {
+                            let exit_event = serde_json::json!({
+                                "event_type": "pid_exit",
+                                "pid": pid,
+                            });
+                            if let Ok(payload) = serde_json::to_vec(&exit_event) {
+                                if !send_event(stream, &payload).await {
+                                    error!("Lost processor connection sending pid_exit. Reconnecting...");
+                                    processor_stream = connect_to_processor().await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => error!("Reconcile error: {}", e),
             }
@@ -614,6 +617,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
             let incomplete = (event.flags & pgdam_common::FLAG_NO_PORT_INFO) != 0;
             let bg_worker = (event.flags & pgdam_common::FLAG_NO_CLIENT) != 0;
+            let truncated = (event.flags & pgdam_common::FLAG_TRUNCATED) != 0;
 
             let event_type = if incomplete {
                 "incomplete"
@@ -645,12 +649,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 );
             } else {
                 info!(
-                    "pid={} type={} user={} db={} src={} sql=\"{}\"",
+                    "pid={} type={} user={} db={} src={} truncated={} sql=\"{}\"",
                     event.pid,
                     event_type,
                     user,
                     db,
                     src_ip,
+                    truncated,
                     sql.trim()
                 );
             }
@@ -664,14 +669,15 @@ async fn main() -> Result<(), anyhow::Error> {
                 db: db.to_string(),
                 src_ip: src_ip.to_string(),
                 incomplete,
+                truncated,
             };
 
             if let Some(ref mut stream) = processor_stream {
-                let mut payload = serde_json::to_vec(&audit)?;
-                payload.push(b'\n');
-                if let Err(e) = stream.write_all(&payload).await {
-                    error!("Lost processor connection: {}. Reconnecting...", e);
-                    processor_stream = connect_to_processor().await;
+                if let Ok(payload) = serde_json::to_vec(&audit) {
+                    if !send_event(stream, &payload).await {
+                        error!("Lost processor connection. Reconnecting...");
+                        processor_stream = connect_to_processor().await;
+                    }
                 }
             }
         } else {

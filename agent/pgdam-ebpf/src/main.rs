@@ -34,6 +34,12 @@ static mut EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024 * 1024, 0);
 #[map]
 static mut DROPPED_EVENTS: Array<u32> = Array::with_max_entries(1, 0);
 
+// sched_process_fork tracepoint memory layout:
+// offset  0–7  : common header
+// offset  8–23 : parent_comm[16]
+// offset 24–27 : parent_pid
+// offset 28–43 : child_comm[16]
+// offset 44–47 : child_pid
 #[tracepoint(name = "on_fork", category = "sched")]
 pub fn on_fork(ctx: TracePointContext) -> i64 {
     let parent_pid: u32 = unsafe {
@@ -96,10 +102,18 @@ fn try_pg_parse_query(ctx: ProbeContext) -> Result<u32, i64> {
         (*ep).flags = 0;
         (*ep).timestamp = bpf_ktime_get_tai_ns();
 
-        (*ep).payload_len = match bpf_probe_read_user_str_bytes(query_ptr, &mut (*ep).payload) {
+        let bytes_read = match bpf_probe_read_user_str_bytes(query_ptr, &mut (*ep).payload) {
             Ok(b) => b.len() as u32,
             Err(_) => 0,
         };
+        (*ep).payload_len = bytes_read;
+
+        // bpf_probe_read_user_str_bytes always null-terminates, so a full
+        // buffer (512 bytes including the null terminator) means the SQL was
+        // longer than the buffer and was truncated.
+        if bytes_read == (*ep).payload.len() as u32 {
+            (*ep).flags |= pgdam_common::FLAG_TRUNCATED;
+        }
 
         let Some(info) = PID_INFO.get(&pid) else {
             (*ep).flags |= pgdam_common::FLAG_NO_PORT_INFO;

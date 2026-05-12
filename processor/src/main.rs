@@ -46,6 +46,7 @@ pub struct ProcessedEvent {
     pub transaction_id: String,
     pub transaction_state: String,
     pub query_sequence: u64,
+    pub truncated: bool,
 }
 
 #[tokio::main]
@@ -115,7 +116,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let sinks: Arc<Vec<Box<dyn Sink>>> = Arc::new(sinks);
-    let enricher: Arc<dyn Enricher> = Arc::from(detect_enricher());
+    let enricher: Arc<dyn Enricher> = Arc::from(detect_enricher().await);
     let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
 
     // Periodically update session store size metric.
@@ -189,10 +190,17 @@ async fn handle_payload(
     let user = event["user"].as_str().unwrap_or("").to_string();
     let db = event["db"].as_str().unwrap_or("").to_string();
     let src_ip = event["src_ip"].as_str().unwrap_or("").to_string();
+    let truncated = event["truncated"].as_bool().unwrap_or(false);
     let event_type = event["event_type"]
         .as_str()
         .unwrap_or("user_query")
         .to_string();
+
+    // pid_exit — clean up session state and return, nothing else to do.
+    if event_type == "pid_exit" {
+        session_store.remove(pid as u32).await;
+        return Ok(());
+    }
 
     if event_type == "incomplete" {
         return Ok(());
@@ -245,6 +253,7 @@ async fn handle_payload(
         transaction_id: query_ctx.transaction_id,
         transaction_state: query_ctx.transaction_state,
         query_sequence: query_ctx.query_sequence,
+        truncated,
     };
 
     for sink in sinks {

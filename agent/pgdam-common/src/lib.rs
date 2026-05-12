@@ -1,8 +1,8 @@
-// pgdam-common/src/lib.rs
 #![no_std]
 
-pub const FLAG_NO_PORT_INFO: u32 = 1 << 0; // PID not yet in PID_INFO — registration race
-pub const FLAG_NO_CLIENT: u32 = 1 << 1; // PID known but port_ptr is null — background worker
+pub const FLAG_NO_PORT_INFO: u32 = 1 << 0;
+pub const FLAG_NO_CLIENT: u32 = 1 << 1;
+pub const FLAG_TRUNCATED: u32 = 1 << 2;
 
 /// Per-process runtime info written by the agent, consumed by every uprobe
 /// firing.  Stored in the PID_INFO map, keyed by PID (u32).

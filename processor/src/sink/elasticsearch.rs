@@ -72,6 +72,7 @@ impl Sink for ElasticSink {
                     "transaction_id":    event.transaction_id,
                     "transaction_state": event.transaction_state,
                     "query_sequence":    event.query_sequence,
+                    "truncated":         event.truncated,
                 }))
                 .send()
                 .await;
