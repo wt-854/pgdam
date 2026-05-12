@@ -17,7 +17,6 @@ pub struct ElasticSink {
 
 impl ElasticSink {
     pub fn new(name: String, url: String, user: String, pass: String) -> Self {
-
         metrics::ELASTICSEARCH_ERRORS_TOTAL
             .with_label_values(&[&name])
             .reset();
