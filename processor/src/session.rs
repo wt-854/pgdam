@@ -68,10 +68,17 @@ impl SessionStore {
         state.query_sequence += 1;
 
         let sql_upper = sql.trim().trim_end_matches(';').to_uppercase();
-        let keyword = sql_upper.split_whitespace().next().unwrap_or("");
+        let mut words = sql_upper.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("");
+        let keyword = if first == "START" && second == "TRANSACTION" {
+            "START TRANSACTION"
+        } else {
+            first
+        };
 
         match keyword {
-            "BEGIN" | "START" => {
+            "BEGIN" | "START" | "START TRANSACTION" => {
                 if state.transaction_state != TransactionState::Open {
                     state.transaction_id = Some(Uuid::new_v4().to_string());
                     state.transaction_state = TransactionState::Open;
