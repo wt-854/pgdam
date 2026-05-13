@@ -2,9 +2,29 @@ use log::warn;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum KillMode {
+    /// Kill decisions are never acted on. Safe default.
+    Disabled,
+    /// OPA flags the query; the kill is logged as recommended but not executed.
+    /// Useful for tuning policies before enabling auto.
+    Manual,
+    /// OPA flags the query; the session is terminated immediately.
+    Auto,
+}
+
+impl Default for KillMode {
+    fn default() -> Self {
+        KillMode::Disabled
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub sinks: SinksConfig,
+    #[serde(default)]
+    pub kill_mode: KillMode,
 }
 
 #[derive(Debug, Deserialize, Clone)]

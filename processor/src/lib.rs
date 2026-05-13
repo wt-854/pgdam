@@ -1,5 +1,6 @@
 pub mod config;
 pub mod enrichment;
+pub mod kill;
 pub mod metrics;
 pub mod normalize;
 pub mod opa;
@@ -33,4 +34,5 @@ pub struct ProcessedEvent {
     pub transaction_state: String,
     pub query_sequence: u64,
     pub truncated: bool,
+    pub kill_triggered: bool,
 }

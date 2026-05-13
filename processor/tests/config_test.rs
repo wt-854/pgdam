@@ -1,4 +1,4 @@
-use pgdam_processor::config::{AuthMechanism, Config};
+use pgdam_processor::config::{AuthMechanism, Config, KillMode};
 
 #[cfg(test)]
 mod tests {
@@ -6,6 +6,30 @@ mod tests {
 
     fn parse(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("Failed to parse config")
+    }
+
+    #[test]
+    fn test_kill_mode_defaults_to_disabled() {
+        let config = parse("sinks: {}");
+        assert_eq!(config.kill_mode, KillMode::Disabled);
+    }
+
+    #[test]
+    fn test_kill_mode_auto() {
+        let config = parse("sinks: {}\nkill_mode: auto");
+        assert_eq!(config.kill_mode, KillMode::Auto);
+    }
+
+    #[test]
+    fn test_kill_mode_manual() {
+        let config = parse("sinks: {}\nkill_mode: manual");
+        assert_eq!(config.kill_mode, KillMode::Manual);
+    }
+
+    #[test]
+    fn test_kill_mode_disabled() {
+        let config = parse("sinks: {}\nkill_mode: disabled");
+        assert_eq!(config.kill_mode, KillMode::Disabled);
     }
 
     #[test]

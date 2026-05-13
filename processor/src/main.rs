@@ -1,9 +1,11 @@
-use log::{error, info};
-use pgdam_processor::config::Config;
+use log::{error, info, warn};
+use pgdam_processor::config::{Config, KillMode};
 use pgdam_processor::enrichment::{detect_enricher, Enricher};
+use pgdam_processor::kill::terminate_session;
+use pgdam_processor::opa::{mask_sql_via_opa, should_kill_via_opa};
 use pgdam_processor::session::SessionStore;
 use pgdam_processor::sink::{ElasticSink, KafkaSink, Sink, StdoutSink};
-use pgdam_processor::{metrics, normalize, opa, ProcessedEvent};
+use pgdam_processor::{metrics, normalize, ProcessedEvent};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +29,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("PGDAM_CONFIG").unwrap_or_else(|_| "/etc/pgdam/config.yaml".to_string());
     let config = Config::load(&config_path)?;
     info!("Loaded config from {}", config_path);
+    info!(
+        "Kill mode: {}",
+        match config.kill_mode {
+            KillMode::Disabled => "disabled",
+            KillMode::Manual => "manual",
+            KillMode::Auto => "auto",
+        }
+    );
 
     // ── Initialize sinks ──────────────────────────────────────────────────────
     let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink)];
@@ -82,6 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sinks: Arc<Vec<Box<dyn Sink>>> = Arc::new(sinks);
     let enricher: Arc<dyn Enricher> = Arc::from(detect_enricher().await);
     let session_store: Arc<SessionStore> = Arc::new(SessionStore::new());
+    let kill_mode: Arc<KillMode> = Arc::new(config.kill_mode);
 
     // Periodically update session store size metric.
     let session_store_for_metrics = Arc::clone(&session_store);
@@ -108,6 +119,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let sinks_clone = Arc::clone(&sinks);
                 let enricher_clone = Arc::clone(&enricher);
                 let session_store_clone = Arc::clone(&session_store);
+                let kill_mode_clone = Arc::clone(&kill_mode);
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
@@ -121,6 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &sinks_clone,
                                     enricher_clone.as_ref(),
                                     &session_store_clone,
+                                    &kill_mode_clone,
                                 )
                                 .await
                                 {
@@ -145,6 +158,7 @@ async fn handle_payload(
     sinks: &[Box<dyn Sink>],
     enricher: &dyn Enricher,
     session_store: &SessionStore,
+    kill_mode: &KillMode,
 ) -> Result<(), Box<dyn Error>> {
     let event: serde_json::Value = serde_json::from_slice(data)?;
 
@@ -185,12 +199,49 @@ async fn handle_payload(
     // 3. Normalize
     let normalized = normalize::normalize_sql(raw_sql);
 
-    // 4. Mask via OPA — skip for background workers
+    // 4. Kill policy — only evaluated for user queries, not background workers
+    let mut kill_triggered = false;
+    if event_type == "user_query" && !matches!(kill_mode, KillMode::Disabled) {
+        let should_kill = should_kill_via_opa(raw_sql, &user, &db, &src_ip, pid as u32).await;
+
+        if should_kill {
+            match kill_mode {
+                KillMode::Auto => {
+                    warn!(
+                        "Kill-switch AUTO: terminating PID {} (user={} db={} src={}) sql=\"{}\"",
+                        pid,
+                        user,
+                        db,
+                        src_ip,
+                        raw_sql.trim()
+                    );
+                    kill_triggered = terminate_session(pid as u32);
+                }
+                KillMode::Manual => {
+                    warn!(
+                        "Kill-switch MANUAL: PID {} flagged for termination \
+                         (user={} db={} src={}) sql=\"{}\" — awaiting manual action",
+                        pid,
+                        user,
+                        db,
+                        src_ip,
+                        raw_sql.trim()
+                    );
+                    // In manual mode we set kill_triggered so the event is
+                    // visible in audit logs and dashboards, but do not act.
+                    kill_triggered = true;
+                }
+                KillMode::Disabled => {}
+            }
+        }
+    }
+
+    // 5. Mask via OPA — skip for background workers
     let masked = if event_type == "background_worker" {
         raw_sql.to_string()
     } else {
         let opa_start = std::time::Instant::now();
-        let result = opa::mask_sql_via_opa(raw_sql).await?;
+        let result = mask_sql_via_opa(raw_sql).await?;
         metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
         result
     };
@@ -218,6 +269,7 @@ async fn handle_payload(
         transaction_state: query_ctx.transaction_state,
         query_sequence: query_ctx.query_sequence,
         truncated,
+        kill_triggered,
     };
 
     for sink in sinks {

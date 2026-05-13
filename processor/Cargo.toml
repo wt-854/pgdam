@@ -25,6 +25,7 @@ rdkafka = { version = "0.36", features = ["cmake-build", "sasl"] }
 prometheus = "0.13"
 lazy_static = "1.4"
 axum = "0.7"
+libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.12"

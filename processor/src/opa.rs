@@ -1,33 +1,54 @@
-use crate::metrics;
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
 #[derive(Serialize)]
-struct OpaInput {
+struct MaskInput {
     value: String,
     column_name: Option<String>,
 }
 
 #[derive(Serialize)]
-struct OpaQuery {
-    input: OpaInput,
+struct MaskQuery {
+    input: MaskInput,
 }
 
 #[derive(Deserialize)]
-struct OpaResponse {
+struct MaskResponse {
     result: bool,
 }
 
+/// Input shape for the kill policy.
+#[derive(Serialize)]
+struct KillInput {
+    sql: String,
+    user: String,
+    db: String,
+    src_ip: String,
+    pid: u32,
+}
+
+#[derive(Serialize)]
+struct KillQuery {
+    input: KillInput,
+}
+
+#[derive(Deserialize)]
+struct KillResponse {
+    result: bool,
+}
+
+const OPA_MASK_URL: &str = "http://127.0.0.1:8181/v1/data/pgdam/masking/mask_field";
+const OPA_KILL_URL: &str = "http://127.0.0.1:8181/v1/data/pgdam/kill/should_kill";
+const OPA_MAX_RETRY: u32 = 3;
+const OPA_RETRY_MS: u64 = 500;
+
 pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
-    let opa_url = "http://127.0.0.1:8181/v1/data/pgdam/masking/mask_field";
 
-    // 1. Parse SQL to identify literals
-    // Using pg_query to evaluate if the SQL is valid
     let _parsed = match pg_query::parse(sql) {
         Ok(r) => r,
-        Err(_) => return Ok(sql.to_string()), // Fallback
+        Err(_) => return Ok(sql.to_string()),
     };
 
     let mut masked_sql = sql.to_string();
@@ -57,43 +78,48 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
         let value = cap.get(0).unwrap().as_str();
         let stripped_value = value.trim_matches('\'');
 
-        let query = OpaQuery {
-            input: OpaInput {
+        let query = MaskQuery {
+            input: MaskInput {
                 value: stripped_value.to_string(),
                 column_name: None,
             },
         };
 
-        let mut opa_res_matched = false;
-        for attempt in 0..3 {
+        let mut matched = false;
+        for attempt in 0..OPA_MAX_RETRY {
             let opa_start = std::time::Instant::now();
-            match client.post(opa_url).json(&query).send().await {
+            match client.post(OPA_MASK_URL).json(&query).send().await {
                 Ok(resp) => {
-                    metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
+                    crate::metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
                     if resp.status().is_success() {
-                        if let Ok(opa_res) = resp.json::<OpaResponse>().await {
-                            opa_res_matched = opa_res.result;
+                        if let Ok(r) = resp.json::<MaskResponse>().await {
+                            matched = r.result;
                             break;
                         }
                     } else {
                         warn!(
-                            "OPA returned error status: {}. Attempt {}/3",
+                            "OPA mask returned error status: {}. Attempt {}/{}",
                             resp.status(),
-                            attempt + 1
+                            attempt + 1,
+                            OPA_MAX_RETRY
                         );
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to query OPA: {}. Attempt {}/3", e, attempt + 1);
+                    warn!(
+                        "Failed to query OPA mask: {}. Attempt {}/{}",
+                        e,
+                        attempt + 1,
+                        OPA_MAX_RETRY
+                    );
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(OPA_RETRY_MS)).await;
         }
 
-        if opa_res_matched {
+        if matched {
             debug!("OPA decided to mask value: {}", value);
-            let range = cap.get(0).unwrap().range();
-            replacements.push((range, "<REDACTED>".to_string()));
+            replacements.push((cap.get(0).unwrap().range(), "<REDACTED>".to_string()));
         }
     }
 
@@ -104,4 +130,55 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
     }
 
     Ok(masked_sql)
+}
+
+/// Ask OPA whether this query event should trigger a session kill.
+/// Returns `true` if the kill policy fires.
+pub async fn should_kill_via_opa(sql: &str, user: &str, db: &str, src_ip: &str, pid: u32) -> bool {
+    let client = reqwest::Client::new();
+    let query = KillQuery {
+        input: KillInput {
+            sql: sql.to_string(),
+            user: user.to_string(),
+            db: db.to_string(),
+            src_ip: src_ip.to_string(),
+            pid,
+        },
+    };
+
+    for attempt in 0..OPA_MAX_RETRY {
+        match client.post(OPA_KILL_URL).json(&query).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<KillResponse>().await {
+                        Ok(r) => return r.result,
+                        Err(e) => warn!("Failed to parse OPA kill response: {}", e),
+                    }
+                } else {
+                    warn!(
+                        "OPA kill returned error status: {}. Attempt {}/{}",
+                        resp.status(),
+                        attempt + 1,
+                        OPA_MAX_RETRY
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to query OPA kill: {}. Attempt {}/{}",
+                    e,
+                    attempt + 1,
+                    OPA_MAX_RETRY
+                );
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(OPA_RETRY_MS)).await;
+    }
+
+    // Fail open — if OPA is unreachable, do not kill.
+    warn!(
+        "OPA kill policy unreachable after {} attempts — failing open (no kill)",
+        OPA_MAX_RETRY
+    );
+    false
 }
