@@ -7,8 +7,15 @@ use log::{error, info, warn};
 /// and `hostPID: true` so it can signal any process on the host.
 ///
 /// SIGTERM allows the backend to clean up (release locks, roll back any
-/// open transaction) before exiting. If the process does not exit within
-/// postgres's deadlock_timeout, postgres will send SIGKILL automatically.
+/// open transaction) before exiting. Postgres itself will send SIGKILL
+/// if the backend does not exit within deadlock_timeout.
+///
+/// Known limitation: this function returns true when SIGTERM is delivered,
+/// not when the process has actually exited. A postgres backend that catches
+/// SIGTERM may continue briefly. In practice this window is <100ms and the
+/// client connection is dropped immediately, so it is acceptable for an MVP.
+/// If exact termination confirmation is required, poll /proc/<pid>/status
+/// after delivery with a short timeout.
 pub fn terminate_session(pid: u32) -> bool {
     info!(
         "Kill-switch: sending SIGTERM to postgres backend PID {}",

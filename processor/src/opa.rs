@@ -1,6 +1,11 @@
+use crate::metrics;
 use log::{debug, warn};
+use once_cell::sync::Lazy;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+
+static OPA_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Serialize)]
 struct MaskInput {
@@ -44,8 +49,6 @@ const OPA_MAX_RETRY: u32 = 3;
 const OPA_RETRY_MS: u64 = 500;
 
 pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-
     let _parsed = match pg_query::parse(sql) {
         Ok(r) => r,
         Err(_) => return Ok(sql.to_string()),
@@ -88,9 +91,9 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
         let mut matched = false;
         for attempt in 0..OPA_MAX_RETRY {
             let opa_start = std::time::Instant::now();
-            match client.post(OPA_MASK_URL).json(&query).send().await {
+            match OPA_CLIENT.post(OPA_MASK_URL).json(&query).send().await {
                 Ok(resp) => {
-                    crate::metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
+                    metrics::OPA_LATENCY.observe(opa_start.elapsed().as_secs_f64());
                     if resp.status().is_success() {
                         if let Ok(r) = resp.json::<MaskResponse>().await {
                             matched = r.result;
@@ -135,7 +138,6 @@ pub async fn mask_sql_via_opa(sql: &str) -> Result<String, Box<dyn Error>> {
 /// Ask OPA whether this query event should trigger a session kill.
 /// Returns `true` if the kill policy fires.
 pub async fn should_kill_via_opa(sql: &str, user: &str, db: &str, src_ip: &str, pid: u32) -> bool {
-    let client = reqwest::Client::new();
     let query = KillQuery {
         input: KillInput {
             sql: sql.to_string(),
@@ -147,7 +149,7 @@ pub async fn should_kill_via_opa(sql: &str, user: &str, db: &str, src_ip: &str, 
     };
 
     for attempt in 0..OPA_MAX_RETRY {
-        match client.post(OPA_KILL_URL).json(&query).send().await {
+        match OPA_CLIENT.post(OPA_KILL_URL).json(&query).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.json::<KillResponse>().await {
