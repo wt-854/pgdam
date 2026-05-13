@@ -18,7 +18,7 @@ use tokio::{io::AsyncWriteExt, net::UnixStream, signal};
 
 mod metrics;
 
-const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DROP_READ_INTERVAL: Duration = Duration::from_secs(10);
 const SOCKET_PATH: &str = "/tmp/pgdam.sock";
 const METRICS_PORT: u16 = 9090;
@@ -96,14 +96,27 @@ fn find_symbol_offset(path: &str, symbol_name: &str) -> Option<u64> {
 fn detect_pg_major(path: &str) -> Option<u32> {
     let data = std::fs::read(path).ok()?;
     let marker = b"PostgreSQL ";
-    let pos = data.windows(marker.len()).position(|w| w == marker)?;
-    let tail = &data[pos + marker.len()..][..8];
-    std::str::from_utf8(tail)
-        .ok()?
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
+    let mut max_version = 0;
+    for i in 0..data.len().saturating_sub(marker.len()) {
+        if &data[i..i + marker.len()] == marker {
+            let mut j = i + marker.len();
+            let mut v = String::new();
+            while j < data.len() && data[j].is_ascii_digit() {
+                v.push(data[j] as char);
+                j += 1;
+            }
+            if let Ok(n) = v.parse::<u32>() {
+                if n > max_version {
+                    max_version = n;
+                }
+            }
+        }
+    }
+    if max_version > 0 {
+        Some(max_version)
+    } else {
+        None
+    }
 }
 
 /// Return Port struct field offsets (remote_host, database_name, user_name)
@@ -121,7 +134,11 @@ fn detect_pg_major(path: &str) -> Option<u32> {
 fn port_field_offsets(major: u32) -> (u32, u32, u32) {
     // (off_remote_host, off_database_name, off_user_name)
     match major {
-        16 | 17 | 18 => (288, 384, 392),
+        14 => (288, 328, 336),
+        15 => (288, 328, 336),
+        16 => (288, 328, 336),
+        17 => (288, 320, 328),
+        18 => (288, 384, 392),
         _ => {
             warn!(
                 "Unknown PG major version {}; falling back to PG18 Port offsets.",
