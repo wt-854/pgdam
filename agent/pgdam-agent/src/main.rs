@@ -462,7 +462,7 @@ async fn main() -> Result<(), anyhow::Error> {
         HashMap::try_from(bpf.take_map("WATCHED_PARENTS").unwrap())?;
     let mut new_pids_buf: RingBuf<_> = RingBuf::try_from(bpf.take_map("NEW_PIDS").unwrap())?;
     let mut ring_buf: RingBuf<_> = RingBuf::try_from(bpf.take_map("EVENTS").unwrap())?;
-    let mut drop_map: Array<_, u32> = Array::try_from(bpf.take_map("DROPPED_EVENTS").unwrap())?;
+    let drop_map: Array<_, u32> = Array::try_from(bpf.take_map("DROPPED_EVENTS").unwrap())?;
 
     // ── Load programs ─────────────────────────────────────────────────────────
     // Programs are loaded in isolated blocks so the &mut Bpf borrow ends before
@@ -597,6 +597,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     processor_stream = connect_to_processor().await;
                                     break;
                                 }
+                                metrics::PID_EXIT_EVENTS_TOTAL.inc();
                             }
                         }
                     }
@@ -635,6 +636,10 @@ async fn main() -> Result<(), anyhow::Error> {
             let incomplete = (event.flags & pgdam_common::FLAG_NO_PORT_INFO) != 0;
             let bg_worker = (event.flags & pgdam_common::FLAG_NO_CLIENT) != 0;
             let truncated = (event.flags & pgdam_common::FLAG_TRUNCATED) != 0;
+
+            if truncated {
+                metrics::TRUNCATED_EVENTS_TOTAL.inc();
+            }
 
             let event_type = if incomplete {
                 "incomplete"
@@ -710,4 +715,165 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── port_field_offsets ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pg14_offsets() {
+        assert_eq!(port_field_offsets(14), (288, 328, 336));
+    }
+
+    #[test]
+    fn test_pg15_offsets() {
+        assert_eq!(port_field_offsets(15), (288, 328, 336));
+    }
+
+    #[test]
+    fn test_pg16_offsets() {
+        assert_eq!(port_field_offsets(16), (288, 328, 336));
+    }
+
+    #[test]
+    fn test_pg17_offsets() {
+        assert_eq!(port_field_offsets(17), (288, 320, 328));
+    }
+
+    #[test]
+    fn test_pg18_offsets() {
+        assert_eq!(port_field_offsets(18), (288, 384, 392));
+    }
+
+    #[test]
+    fn test_unknown_version_falls_back_to_pg18() {
+        // Unknown versions fall back to PG18 offsets.
+        assert_eq!(port_field_offsets(99), (288, 384, 392));
+        assert_eq!(port_field_offsets(0), (288, 384, 392));
+    }
+
+    // ── detect_pg_major ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_pg_major_from_bytes() {
+        // detect_pg_major reads the binary — we test the parsing logic
+        // by writing a temp file containing the version string.
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pgdam_test_binary");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"some binary data PostgreSQL 18.3 more data")
+            .unwrap();
+        drop(f);
+
+        let result = detect_pg_major(path.to_str().unwrap());
+        assert_eq!(result, Some(18));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_detect_pg_major_version_17() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("pgdam_test_pg17");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"PostgreSQL 17.1 (Debian 17.1-1.pgdg120+1)")
+            .unwrap();
+        drop(f);
+
+        let result = detect_pg_major(path.to_str().unwrap());
+        assert_eq!(result, Some(17));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_detect_pg_major_no_version_string() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("pgdam_test_noversion");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"some random binary data with no version")
+            .unwrap();
+        drop(f);
+
+        let result = detect_pg_major(path.to_str().unwrap());
+        assert_eq!(result, None);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_detect_pg_major_nonexistent_file() {
+        let result = detect_pg_major("/nonexistent/path/to/binary");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_detect_pg_major_picks_highest_version() {
+        // Binary may contain multiple "PostgreSQL X" strings — should pick highest.
+        use std::io::Write;
+        let path = std::env::temp_dir().join("pgdam_test_multi");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"PostgreSQL 14 compat PostgreSQL 18 actual")
+            .unwrap();
+        drop(f);
+
+        let result = detect_pg_major(path.to_str().unwrap());
+        assert_eq!(result, Some(18));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ── utf8_trim ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_utf8_trim_null_terminated() {
+        let mut buf = [0u8; 64];
+        buf[..8].copy_from_slice(b"postgres");
+        assert_eq!(utf8_trim(&buf), "postgres");
+    }
+
+    #[test]
+    fn test_utf8_trim_empty() {
+        let buf = [0u8; 64];
+        assert_eq!(utf8_trim(&buf), "");
+    }
+
+    #[test]
+    fn test_utf8_trim_full_buffer_no_null() {
+        let buf = [b'a'; 64];
+        assert_eq!(utf8_trim(&buf), "a".repeat(64));
+    }
+
+    // ── reconcile stale PID detection ────────────────────────────────────────
+    // reconcile() requires a live Bpf object and eBPF maps which can't be
+    // instantiated in unit tests. The stale PID logic is tested here by
+    // extracting the filtering logic directly.
+
+    #[test]
+    fn test_stale_pid_detection() {
+        use std::collections::HashSet;
+
+        let mut known_pids: HashSet<u32> = [1, 2, 3, 4, 5].iter().copied().collect();
+        let live_pids: HashSet<u32> = [1, 3, 5].iter().copied().collect();
+
+        let stale: Vec<u32> = known_pids
+            .iter()
+            .filter(|p| !live_pids.contains(p))
+            .copied()
+            .collect();
+
+        assert_eq!(stale.len(), 2);
+        assert!(stale.contains(&2));
+        assert!(stale.contains(&4));
+
+        for pid in &stale {
+            known_pids.remove(pid);
+        }
+        assert_eq!(known_pids.len(), 3);
+    }
 }

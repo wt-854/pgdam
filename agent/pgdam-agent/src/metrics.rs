@@ -25,6 +25,16 @@ lazy_static! {
         "Total background worker events captured"
     )
     .unwrap();
+    pub static ref TRUNCATED_EVENTS_TOTAL: IntCounter = register_int_counter!(
+        "pgdam_truncated_events_total",
+        "Total events where SQL was truncated due to payload buffer limit"
+    )
+    .unwrap();
+    pub static ref PID_EXIT_EVENTS_TOTAL: IntCounter = register_int_counter!(
+        "pgdam_pid_exit_events_total",
+        "Total pid_exit events sent to processor for session cleanup"
+    )
+    .unwrap();
     pub static ref PID_MAP_SIZE: IntGauge = register_int_gauge!(
         "pgdam_pid_map_size",
         "Current number of PIDs registered in PID_INFO"
@@ -42,6 +52,8 @@ pub fn init_metrics() {
     EVENTS_DROPPED_TOTAL.reset();
     INCOMPLETE_EVENTS_TOTAL.reset();
     BG_WORKER_EVENTS_TOTAL.reset();
+    TRUNCATED_EVENTS_TOTAL.reset();
+    PID_EXIT_EVENTS_TOTAL.reset();
     PID_MAP_SIZE.set(0);
     BINARY_COUNT.set(0);
 }
