@@ -1,0 +1,137 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-sasl
+spec:
+  ports:
+    - name: kafka-client
+      port: 9092
+      targetPort: 9092
+  selector:
+    app: kafka-sasl
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-sasl-credentials
+type: Opaque
+stringData:
+  username: kafka
+  password: kafka-password
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-sasl-jaas
+data:
+  kafka_server_jaas.conf: |
+    KafkaServer {
+      org.apache.kafka.common.security.plain.PlainLoginModule required
+      username="kafka"
+      password="kafka-password"
+      user_kafka="kafka-password";
+    };
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-sasl
+spec:
+  serviceName: kafka-sasl
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-sasl
+  template:
+    metadata:
+      labels:
+        app: kafka-sasl
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:latest
+          ports:
+            - containerPort: 9092
+              name: kafka
+          env:
+            # Required cluster config
+            - name: CLUSTER_ID
+              value: "MkU3OEVBNTcwNTJENDM2Q"
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            
+            # Listeners
+            - name: KAFKA_LISTENERS
+              value: "SASL_PLAINTEXT://0.0.0.0:9092,PLAINTEXT://0.0.0.0:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "SASL_PLAINTEXT://kafka-sasl-0.kafka-sasl:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "SASL_PLAINTEXT:SASL_PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "SASL_PLAINTEXT"
+            
+            # SASL config
+            - name: KAFKA_SASL_ENABLED_MECHANISMS
+              value: "PLAIN"
+            - name: KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL
+              value: "PLAIN"
+            
+            # JAAS file path
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/etc/kafka/kafka_server_jaas.conf"
+            
+            # Internal topic replication factors
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            
+            # Other config
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+            - name: jaas-config
+              mountPath: /etc/kafka/kafka_server_jaas.conf
+              subPath: kafka_server_jaas.conf
+      volumes:
+        - name: jaas-config
+          configMap:
+            name: kafka-sasl-jaas
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+# # Create client properties file
+# cat > /tmp/client.properties << EOF
+# security.protocol=SASL_PLAINTEXT
+# sasl.mechanism=PLAIN
+# sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="kafka" password="kafka-password";
+# EOF
+
+# # List topics (should work with SASL)
+# /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list --command-config /tmp/client.properties
+
+# # Create your topic
+# /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic pgdam.user-queries --partitions 1 --replication-factor 1 --command-config /tmp/client.properties
+
+# consume
+# /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic pgdam.user-queries --from-beginning --command-config /tmp/client.properties

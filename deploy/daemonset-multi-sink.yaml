@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pgdam-agent
+  namespace: pgdam
+  labels:
+    app: pgdam-agent
+spec:
+  selector:
+    matchLabels:
+      app: pgdam-agent
+  template:
+    metadata:
+      labels:
+        app: pgdam-agent
+    spec:
+      serviceAccountName: pgdam-agent
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      # 1. eBPF Agent: Captures SQL and sends to Processor UDS
+      - name: agent
+        image: localhost/pgdam-agent:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        ports:
+        - name: metrics-agent
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: RUST_LOG
+          value: info
+        volumeMounts:
+        - name: sys-kernel-debug
+          mountPath: /sys/kernel/debug
+          readOnly: true
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+        - name: host-proc
+          mountPath: /proc
+        - name: shared-uds
+          mountPath: /tmp
+      
+      # 2. Processor: Normalizes and Masks SQL via OPA
+      - name: processor
+        image: localhost/pgdam-processor:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        ports:
+        - name: metrics-proc
+          containerPort: 9091
+          protocol: TCP
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Elasticsearch credentials (referenced by config.yaml)
+        - name: ELASTIC_USER
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: username
+        - name: ELASTIC_PASS
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: password
+        # Kafka credentials for prod instance (referenced by config.yaml)
+        - name: KAFKA_PROD_USER
+          valueFrom:
+            secretKeyRef:
+              name: kafka-sasl-credentials
+              key: username
+        - name: KAFKA_PROD_PASS
+          valueFrom:
+            secretKeyRef:
+              name: kafka-sasl-credentials
+              key: password
+        # Point processor to config file (optional: defaults to /etc/pgdam/config.yaml)
+        - name: PGDAM_CONFIG
+          value: /etc/pgdam/config.yaml
+        volumeMounts:
+        - name: shared-uds
+          mountPath: /tmp
+        - name: pgdam-config
+          mountPath: /etc/pgdam/config.yaml
+          subPath: config.yaml
+          readOnly: true
+      
+      # 3. OPA: Sidecar for dynamic policy evaluation
+      - name: opa
+        image: openpolicyagent/opa:latest
+        args:
+        - "run"
+        - "--server"
+        - "--addr=0.0.0.0:8181"
+        - "/policies"
+        volumeMounts:
+        - name: policy-vol
+          mountPath: /policies/mask.rego
+          subPath: mask.rego
+          readOnly: true
+        - name: policy-vol
+          mountPath: /policies/kill.rego
+          subPath: kill.rego
+          readOnly: true
+          
+      volumes:
+      - name: sys-kernel-debug
+        hostPath:
+          path: /sys/kernel/debug
+      - name: sys-fs-bpf
+        hostPath:
+          path: /sys/fs/bpf
+      - name: host-proc
+        hostPath:
+          path: /proc
+      - name: shared-uds
+        emptyDir: {}
+      - name: policy-vol
+        configMap:
+          name: pgdam-policies
+      - name: pgdam-config
+        configMap:
+          name: pgdam-config

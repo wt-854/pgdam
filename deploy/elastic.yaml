@@ -73,3 +73,50 @@ spec:
       resources:
         requests:
           storage: 1Gi
+
+#############################################################################################
+# 
+#  Use flattened type for all dynamic key-value maps (e.g. k8s_labels) to allow for flexible
+#  querying and aggregation in Elasticsearch without needing to predefine all possible keys.
+# 
+# curl -X PUT "http://localhost:9200/_index_template/pgdam-audit-template" \
+#   -u "elastic:pgdam-elastic-pass" \
+#   -H 'Content-Type: application/json' \
+#   -d '{
+#     "index_patterns": ["pgdam-audit-*"],
+#     "priority": 100,
+#     "template": {
+#       "settings": {
+#         "number_of_shards": 1,
+#         "number_of_replicas": 1
+#       },
+#       "mappings": {
+#         "properties": {
+#           "pid": { "type": "integer" },
+#           "timestamp": { "type": "keyword" },
+#           "event_type": { "type": "keyword" },
+#           "user": { "type": "keyword" },
+#           "db": { "type": "keyword" },
+#           "src_ip": { "type": "keyword" },
+#           "raw_sql": { "type": "text" },
+#           "normalized_sql": { "type": "text" },
+#           "masked_sql": { "type": "text" },
+#           "hostname": { "type": "keyword" },
+#           "container_id": { "type": "keyword" },
+#           "container_name": { "type": "keyword" },
+#           "k8s_pod": { "type": "keyword" },
+#           "k8s_namespace": { "type": "keyword" },
+#           "k8s_node": { "type": "keyword" },
+#           "k8s_labels": {
+#             "type": "flattened"
+#           },
+#           "session_id": { "type": "keyword" },
+#           "session_start": { "type": "keyword" },
+#           "transaction_id": { "type": "keyword" },
+#           "transaction_state": { "type": "keyword" },
+#           "query_sequence": { "type": "long" }
+#         }
+#       }
+#     }
+#   }'
+# 
