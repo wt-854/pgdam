@@ -5,7 +5,7 @@ metadata:
   namespace: pgdam
 data:
   mask.rego: |
-    package pgdam.masking
+    package pgdam.mask
 
     import future.keywords.if
 
@@ -20,8 +20,8 @@ data:
     }
 
     # Rule to mask based on common sensitive column names
+    sensitive_columns := {"email", "ssn", "credit_card", "password", "secret"}
     mask_field if {
-        sensitive_columns := {"email", "ssn", "credit_card", "password", "secret"}
         input.column_name != null
         sensitive_columns[input.column_name]
     }
@@ -34,59 +34,54 @@ data:
 
     default should_kill := false
 
-    # ── SQLi detection ────────────────────────────────────────────────────────
-    # UNION-based injection
-    should_kill if {
+    # 1. Define Whitelists
+    trusted_users := {"postgres", "admin", "dba"}
+    trusted_sources := {"127.0.0.1", "::1"}
+    # Adding [local] to trusted_sources is too braod for production
+    # trusted_sources := {"[local]", "127.0.0.1", "::1"}
+
+    # 2. Define the "Kill" logic as a sub-rule (is_malicious)
+    is_malicious if {
         regex.match(`(?i)\bUNION\b.{0,100}\bSELECT\b`, input.sql)
     }
 
-    # Comment-based injection
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)(--|\/\*).{0,50}\b(OR|AND)\b.{0,50}(=|LIKE)`, input.sql)
     }
 
-    # Tautology injection (OR 1=1 --)
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\b(OR|AND)\b\s+[\w'"]+=[\w'"]+\s*--`, input.sql)
     }
 
-    # Stacked queries (semicolon followed by DDL)
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i);\s*(DROP|DELETE|INSERT|UPDATE|CREATE|ALTER|TRUNCATE)\b`, input.sql)
     }
 
-    # Boolean-based blind injection
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\b(OR|AND)\b\s+\d+\s*=\s*\d+`, input.sql)
     }
 
-    # ── Privilege escalation ──────────────────────────────────────────────────
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\bALTER\s+ROLE\b.{0,100}\bSUPERUSER\b`, input.sql)
     }
 
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\bCREATE\s+ROLE\b.{0,100}\bSUPERUSER\b`, input.sql)
     }
 
-    # ── Dangerous operations (non-DBA users only) ─────────────────────────────
-    trusted_users := {"postgres", "admin", "dba"}
-
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\bDROP\s+(DATABASE|SCHEMA|TABLE)\b`, input.sql)
         not input.user in trusted_users
     }
 
-    # ── Sensitive system table access (non-DBA users only) ────────────────────
-    should_kill if {
+    is_malicious if {
         regex.match(`(?i)\bpg_shadow\b`, input.sql)
         not input.user in trusted_users
     }
 
-    # ── Trusted sources whitelist ─────────────────────────────────────────────
-    # Never kill connections from localhost or Unix socket connections.
-    trusted_sources := {"[local]", "127.0.0.1", "::1"}
-
-    should_kill := false if {
-        input.src_ip in trusted_sources
+    # 3. Final Decision Logic
+    # This rule only returns true if it's malicious AND NOT from a trusted source.
+    should_kill if {
+        is_malicious
+        not input.src_ip in trusted_sources
     }

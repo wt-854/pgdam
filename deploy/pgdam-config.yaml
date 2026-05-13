@@ -8,7 +8,7 @@ data:
     # pgdam-processor configuration
     # Credentials are resolved from env vars at runtime (see DaemonSet env section)
 
-    kill_mode: auto  # disabled | manual | auto
+    kill_mode: manual  # disabled | manual | auto
 
     sinks:
       elasticsearch:
