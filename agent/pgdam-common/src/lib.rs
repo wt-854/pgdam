@@ -3,6 +3,9 @@
 pub const FLAG_NO_PORT_INFO: u32 = 1 << 0;
 pub const FLAG_NO_CLIENT: u32 = 1 << 1;
 pub const FLAG_TRUNCATED: u32 = 1 << 2;
+pub const PORT_FLAG_HOST_IS_INLINE: u32 = 1 << 0; // remote_host is char[] not char*
+pub const PORT_FLAG_DB_IS_INLINE: u32 = 1 << 1; // database_name is char[] not char*
+pub const PORT_FLAG_USER_IS_INLINE: u32 = 1 << 2; // user_name is char[] not char*
 
 /// Per-process runtime info written by the agent, consumed by every uprobe
 /// firing.  Stored in the PID_INFO map, keyed by PID (u32).
@@ -49,7 +52,7 @@ pub struct BinaryConfig {
 
     /// Explicit padding so the struct size is a multiple of 8 bytes and the
     /// eBPF verifier does not reject it as unaligned.
-    pub _pad: u32,
+    pub port_flags: u32,
 }
 
 /// Ring-buffer event: one SQL query capture forwarded to the agent.

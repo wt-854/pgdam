@@ -109,8 +109,7 @@ fn try_pg_parse_query(ctx: ProbeContext) -> Result<u32, i64> {
         (*ep).payload_len = bytes_read;
 
         // bpf_probe_read_user_str_bytes always null-terminates, so a full
-        // buffer (512 bytes including the null terminator) means the SQL was
-        // longer than the buffer and was truncated.
+        // buffer means the SQL was longer than the buffer and was truncated.
         if bytes_read == (*ep).payload.len() as u32 {
             (*ep).flags |= pgdam_common::FLAG_TRUNCATED;
         }
@@ -129,26 +128,59 @@ fn try_pg_parse_query(ctx: ProbeContext) -> Result<u32, i64> {
 
         let abs_addr = info.load_base + cfg.symbol_offset;
 
-        match bpf_probe_read_user::<*const core::ffi::c_void>(abs_addr as *const _) {
-            Ok(port_ptr) if !port_ptr.is_null() => {
-                macro_rules! read_str {
-                    ($off:expr, $buf:expr) => {
-                        if let Ok(ptr) = bpf_probe_read_user::<*const u8>(
-                            (port_ptr as usize + $off as usize) as *const _,
-                        ) {
-                            if !ptr.is_null() {
-                                let _ = bpf_probe_read_user_str_bytes(ptr, $buf);
-                            }
+        // Read the Port* pointer stored at MyProcPort's address (e.g., read at 0xfcf310)
+        let port_ptr = match bpf_probe_read_user::<*const core::ffi::c_void>(abs_addr as *const _) {
+            Ok(ptr) => ptr,
+            Err(_) => core::ptr::null(),
+        };
+
+        if !port_ptr.is_null() {
+            // Read a field that is a char* pointer inside the Port struct
+            // The field at (port_ptr + offset) holds the address of the string
+            macro_rules! read_str_ptr {
+                ($off:expr, $buf:expr) => {
+                    if let Ok(str_ptr) = bpf_probe_read_user::<*const u8>(
+                        (port_ptr as usize + $off as usize) as *const _,
+                    ) {
+                        if !str_ptr.is_null() {
+                            let _ = bpf_probe_read_user_str_bytes(str_ptr, $buf);
                         }
-                    };
-                }
-                read_str!(cfg.off_user_name, &mut (*ep).user_name);
-                read_str!(cfg.off_database_name, &mut (*ep).database_name);
-                read_str!(cfg.off_remote_host, &mut (*ep).remote_host);
+                    }
+                };
             }
-            _ => {
-                (*ep).flags |= pgdam_common::FLAG_NO_CLIENT;
+
+            // Read a field that is an inline char[] array inside the Port struct
+            // The string bytes start directly at (port_ptr + offset)
+            macro_rules! read_str_inline {
+                ($off:expr, $buf:expr) => {
+                    let src = (port_ptr as usize + $off as usize) as *const u8;
+                    let _ = bpf_probe_read_user_str_bytes(src, $buf);
+                };
             }
+
+            let host_inline = (cfg.port_flags & pgdam_common::PORT_FLAG_HOST_IS_INLINE) != 0;
+            let db_inline = (cfg.port_flags & pgdam_common::PORT_FLAG_DB_IS_INLINE) != 0;
+            let user_inline = (cfg.port_flags & pgdam_common::PORT_FLAG_USER_IS_INLINE) != 0;
+
+            if host_inline {
+                read_str_inline!(cfg.off_remote_host, &mut (*ep).remote_host);
+            } else {
+                read_str_ptr!(cfg.off_remote_host, &mut (*ep).remote_host);
+            }
+
+            if db_inline {
+                read_str_inline!(cfg.off_database_name, &mut (*ep).database_name);
+            } else {
+                read_str_ptr!(cfg.off_database_name, &mut (*ep).database_name);
+            }
+
+            if user_inline {
+                read_str_inline!(cfg.off_user_name, &mut (*ep).user_name);
+            } else {
+                read_str_ptr!(cfg.off_user_name, &mut (*ep).user_name);
+            }
+        } else {
+            (*ep).flags |= pgdam_common::FLAG_NO_CLIENT;
         }
     }
 

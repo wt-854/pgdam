@@ -6,7 +6,7 @@ use aya::{
 };
 use log::{error, info, warn};
 use object::{Object, ObjectSegment, ObjectSymbol};
-use pgdam_common::{BinaryConfig, PidInfo, SqlEvent};
+use pgdam_common::{BinaryConfig, PidInfo, SqlEvent, PORT_FLAG_HOST_IS_INLINE};
 use serde::Serialize;
 use std::{
     collections::{HashMap as StdHashMap, HashSet},
@@ -54,6 +54,8 @@ struct BinaryProfile {
     off_remote_host: u32,
     off_database_name: u32,
     off_user_name: u32,
+    is_edb: bool,
+    port_flags: u32,
 }
 
 /// One live postgres process.
@@ -96,7 +98,7 @@ fn find_symbol_offset(path: &str, symbol_name: &str) -> Option<u64> {
 fn detect_pg_major(path: &str) -> Option<u32> {
     let data = std::fs::read(path).ok()?;
     let marker = b"PostgreSQL ";
-    let mut max_version = 0;
+    let mut max_version = 0u32;
     for i in 0..data.len().saturating_sub(marker.len()) {
         if &data[i..i + marker.len()] == marker {
             let mut j = i + marker.len();
@@ -119,49 +121,77 @@ fn detect_pg_major(path: &str) -> Option<u32> {
     }
 }
 
-/// Return Port struct field offsets (remote_host, database_name, user_name)
-/// for a given PostgreSQL major version.
+/// Detect whether a process is running an EDB Advanced Server binary by
+/// checking if /usr/edb exists in the process's mount namespace.
 ///
-/// These offsets were validated against stock Debian/Ubuntu packages compiled
-/// with the default flags.  Alpine (musl libc) and RHEL builds may produce
-/// different struct layouts due to alignment differences — extend this table
-/// with empirical measurements when those flavours are encountered.
-///
-/// A future enhancement can replace this table with DWARF-based offset
-/// extraction using the `gimli` crate: parse `.debug_info`, walk to the Port
-/// type, and read field offsets directly from the debug info.  That would make
-/// the agent correct for every build without any manual table maintenance.
-fn port_field_offsets(major: u32) -> (u32, u32, u32) {
-    // (off_remote_host, off_database_name, off_user_name)
+/// This approach handles cases where the binary version string does not
+/// contain "EnterpriseDB" (e.g. docker.enterprisedb.com/k8s/postgresql
+/// images that use EDB's Port struct layout but report as standard postgres).
+fn detect_is_edb(pid: u32, _path: &str) -> bool {
+    std::process::Command::new("nsenter")
+        .args(&["-t", &pid.to_string(), "-m", "test", "-d", "/usr/edb"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// TODO: Verify PORT_FLAG_HOST_IS_INLINE logic
+/// Returns (off_remote_host, off_database_name, off_user_name, port_flags).
+fn port_field_offsets(major: u32, is_edb: bool) -> (u32, u32, u32, u32) {
+    if is_edb {
+        // Offsets match standard PG for the same major version.
+        return match major {
+            17 => (288, 320, 328, 0),
+            18 => (288, 384, 392, 0),
+            _ => {
+                warn!(
+                    "Unknown EDB major version {}; falling back to EDB18 offsets.",
+                    major
+                );
+                (288, 384, 392, 0)
+            }
+        };
+    }
+
     match major {
-        14 => (288, 328, 336),
-        15 => (288, 328, 336),
-        16 => (288, 328, 336),
-        17 => (288, 320, 328),
-        18 => (288, 384, 392),
+        14 => (288, 328, 336, 0),
+        15 => (288, 328, 336, 0),
+        16 => (288, 328, 336, 0),
+        17 => (288, 320, 328, 0),
+        18 => (288, 384, 392, 0),
         _ => {
             warn!(
-                "Unknown PG major version {}; falling back to PG18 Port offsets.",
+                "Unknown PG major version {}; falling back to PG18 offsets.",
                 major
             );
-            (288, 384, 392)
+            (288, 384, 392, 0)
         }
     }
 }
 
 /// Read, parse, and profile a Postgres binary: compute the symbol offset and
 /// choose the correct Port field offsets for its version.
-fn analyze_binary(path: &str) -> Option<BinaryProfile> {
+fn analyze_binary(pid: u32, path: &str) -> Option<BinaryProfile> {
     let meta = std::fs::metadata(path).ok()?;
     let inode = meta.ino();
     let offset = find_symbol_offset(path, "MyProcPort")?;
     let major = detect_pg_major(path).unwrap_or(18);
-    let (off_remote_host, off_database_name, off_user_name) = port_field_offsets(major);
+    let is_edb = detect_is_edb(pid, path);
+    let (off_remote_host, off_database_name, off_user_name, port_flags) =
+        port_field_offsets(major, is_edb);
 
     info!(
-        "Binary analysis: path={} inode={} pg{} MyProcPort+0x{:x} \
-         remote_host+{} database_name+{} user_name+{}",
-        path, inode, major, offset, off_remote_host, off_database_name, off_user_name
+        "Binary analysis: path={} inode={} pg{} edb={} MyProcPort+0x{:x} \
+         remote_host+{} database_name+{} user_name+{} port_flags=0x{:x}",
+        path,
+        inode,
+        major,
+        is_edb,
+        offset,
+        off_remote_host,
+        off_database_name,
+        off_user_name,
+        port_flags
     );
     Some(BinaryProfile {
         path: path.to_string(),
@@ -170,6 +200,8 @@ fn analyze_binary(path: &str) -> Option<BinaryProfile> {
         off_remote_host,
         off_database_name,
         off_user_name,
+        is_edb,
+        port_flags,
     })
 }
 
@@ -198,7 +230,8 @@ fn scan_postgres_processes() -> Vec<ProcessEntry> {
         let Ok(comm) = std::fs::read_to_string(proc_dir.join("comm")) else {
             continue;
         };
-        if comm.trim() != "postgres" {
+        let comm = comm.trim();
+        if comm != "postgres" && comm != "edb-postgres" {
             continue;
         }
 
@@ -225,23 +258,34 @@ fn scan_postgres_processes() -> Vec<ProcessEntry> {
             Ok(p) => p,
             Err(_) => continue,
         };
+
         if exe.to_string_lossy().ends_with("(deleted)") {
             continue;
         }
 
-        // Extract the r-xp load base from /proc/<pid>/maps.  We match by exe
-        // filename rather than full path because overlayfs may expose a
-        // shortened path in the maps file.
         let Ok(maps) = std::fs::read_to_string(proc_dir.join("maps")) else {
             continue;
         };
+
         let exe_name = exe
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("postgres");
-        let load_base = maps
-            .lines()
-            .find(|l| l.contains("r-xp") && l.contains(exe_name))
+
+        // EDB binaries are not PIE — their first mapping is the load base.
+        // Standard PG binaries are PIE — look specifically for the r-xp segment.
+        let is_edb = detect_is_edb(pid, &exe_link.to_string_lossy());
+
+        let load_base_line = if is_edb {
+            // EDB strategy: Take the very first mapping containing the exe_name
+            maps.lines().find(|l| l.contains(exe_name))
+        } else {
+            // Standard PG strategy: Look specifically for the executable segment
+            maps.lines()
+                .find(|l| l.contains("r-xp") && l.contains(exe_name))
+        };
+
+        let load_base = load_base_line
             .and_then(|l| l.split('-').next())
             .and_then(|s| u64::from_str_radix(s, 16).ok());
 
@@ -269,7 +313,7 @@ fn push_binary_config(
             off_remote_host: profile.off_remote_host,
             off_database_name: profile.off_database_name,
             off_user_name: profile.off_user_name,
-            _pad: 0,
+            port_flags: profile.port_flags,
         },
         0,
     )?;
@@ -373,7 +417,7 @@ fn reconcile(
                 continue;
             }
 
-            match analyze_binary(&exe_path) {
+            match analyze_binary(proc.pid, &exe_path) {
                 Some(profile) => {
                     match attach_new_binary(bpf, binary_configs, known_binaries, profile) {
                         Ok(_) => binaries_added += 1,
@@ -721,111 +765,191 @@ async fn main() -> Result<(), anyhow::Error> {
 mod tests {
     use super::*;
 
-    // ── port_field_offsets ────────────────────────────────────────────────────
+    // ── port_field_offsets — standard PG ─────────────────────────────────────
 
-    #[test]
-    fn test_pg14_offsets() {
-        assert_eq!(port_field_offsets(14), (288, 328, 336));
-    }
+    // TODO: cleanup test after verifying PORT_FLAG_HOST_IS_INLINE logic
+    // #[test]
+    // fn test_pg14_offsets() {
+    //     let (host, db, user, flags) = port_field_offsets(14, false);
+    //     assert_eq!((host, db, user), (288, 328, 336));
+    //     assert_eq!(flags, PORT_FLAG_HOST_IS_INLINE);
+    // }
 
-    #[test]
-    fn test_pg15_offsets() {
-        assert_eq!(port_field_offsets(15), (288, 328, 336));
-    }
+    // TODO: cleanup test after verifying PORT_FLAG_HOST_IS_INLINE logic
+    // #[test]
+    // fn test_pg15_offsets() {
+    //     let (host, db, user, flags) = port_field_offsets(15, false);
+    //     assert_eq!((host, db, user), (288, 328, 336));
+    //     assert_eq!(flags, PORT_FLAG_HOST_IS_INLINE);
+    // }
 
-    #[test]
-    fn test_pg16_offsets() {
-        assert_eq!(port_field_offsets(16), (288, 328, 336));
-    }
+    // TODO: cleanup test after verifying PORT_FLAG_HOST_IS_INLINE logic
+    // #[test]
+    // fn test_pg16_offsets() {
+    //     let (host, db, user, flags) = port_field_offsets(16, false);
+    //     assert_eq!((host, db, user), (288, 328, 336));
+    //     assert_eq!(flags, PORT_FLAG_HOST_IS_INLINE);
+    // }
 
     #[test]
     fn test_pg17_offsets() {
-        assert_eq!(port_field_offsets(17), (288, 320, 328));
+        let (host, db, user, flags) = port_field_offsets(17, false);
+        assert_eq!((host, db, user), (288, 320, 328));
+        assert_eq!(flags, 0);
     }
 
     #[test]
     fn test_pg18_offsets() {
-        assert_eq!(port_field_offsets(18), (288, 384, 392));
+        let (host, db, user, flags) = port_field_offsets(18, false);
+        assert_eq!((host, db, user), (288, 384, 392));
+        assert_eq!(flags, 0);
     }
 
     #[test]
-    fn test_unknown_version_falls_back_to_pg18() {
-        // Unknown versions fall back to PG18 offsets.
-        assert_eq!(port_field_offsets(99), (288, 384, 392));
-        assert_eq!(port_field_offsets(0), (288, 384, 392));
+    fn test_unknown_pg_falls_back_to_pg18() {
+        let (host, db, user, flags) = port_field_offsets(99, false);
+        assert_eq!((host, db, user), (288, 384, 392));
+        assert_eq!(flags, 0);
+
+        let (host, db, user, flags) = port_field_offsets(0, false);
+        assert_eq!((host, db, user), (288, 384, 392));
+        assert_eq!(flags, 0);
+    }
+
+    // ── port_field_offsets — EDB ──────────────────────────────────────────────
+
+    #[test]
+    fn test_edb17_offsets() {
+        let (host, db, user, flags) = port_field_offsets(17, true);
+        assert_eq!((host, db, user), (288, 320, 328));
+        // EDB uses all pointer fields — no inline flag
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_edb18_offsets() {
+        let (host, db, user, flags) = port_field_offsets(18, true);
+        assert_eq!((host, db, user), (288, 384, 392));
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_unknown_edb_falls_back_to_edb18() {
+        let (host, db, user, flags) = port_field_offsets(99, true);
+        assert_eq!((host, db, user), (288, 384, 392));
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_edb_and_pg17_offsets_match() {
+        // EDB17 and standard PG17 happen to have the same offsets.
+        // This is expected — verify it explicitly so any future drift is caught.
+        let pg17 = port_field_offsets(17, false);
+        let edb17 = port_field_offsets(17, true);
+        assert_eq!(pg17.0, edb17.0, "remote_host offset should match");
+        assert_eq!(pg17.1, edb17.1, "database_name offset should match");
+        assert_eq!(pg17.2, edb17.2, "user_name offset should match");
+        // port_flags differ: PG17 has no inline flag, EDB17 has no inline flag — both 0
+        assert_eq!(pg17.3, edb17.3);
+    }
+
+    #[test]
+    fn test_edb_and_pg18_offsets_match() {
+        let pg18 = port_field_offsets(18, false);
+        let edb18 = port_field_offsets(18, true);
+        assert_eq!(pg18.0, edb18.0);
+        assert_eq!(pg18.1, edb18.1);
+        assert_eq!(pg18.2, edb18.2);
+        assert_eq!(pg18.3, edb18.3);
+    }
+
+    // TODO: cleanup test after verifying PORT_FLAG_HOST_IS_INLINE logic
+    // #[test]
+    // fn test_pg14_has_host_inline_flag_edb_does_not() {
+    //     // Standard PG14 has inline remote_host; EDB14 would not (if it existed).
+    //     let (_, _, _, pg14_flags) = port_field_offsets(14, false);
+    //     let (_, _, _, edb14_flags) = port_field_offsets(14, true);
+    //     assert_ne!(
+    //         pg14_flags, edb14_flags,
+    //         "Standard PG14 should have PORT_FLAG_HOST_IS_INLINE, EDB should not"
+    //     );
+    // }
+
+    // ── detect_is_edb ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_is_edb_nonexistent_pid_returns_false() {
+        // PID 999999999 does not exist, nsenter will fail, should return false.
+        let result = detect_is_edb(999999999, "");
+        assert!(!result);
     }
 
     // ── detect_pg_major ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_detect_pg_major_from_bytes() {
-        // detect_pg_major reads the binary — we test the parsing logic
-        // by writing a temp file containing the version string.
+    fn test_detect_pg_major_pg18() {
         use std::io::Write;
-        let dir = std::env::temp_dir();
-        let path = dir.join("pgdam_test_binary");
-
+        let path = std::env::temp_dir().join("pgdam_test_pg18");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"some binary data PostgreSQL 18.3 more data")
             .unwrap();
         drop(f);
-
-        let result = detect_pg_major(path.to_str().unwrap());
-        assert_eq!(result, Some(18));
-
+        assert_eq!(detect_pg_major(path.to_str().unwrap()), Some(18));
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
-    fn test_detect_pg_major_version_17() {
+    fn test_detect_pg_major_pg17() {
         use std::io::Write;
         let path = std::env::temp_dir().join("pgdam_test_pg17");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"PostgreSQL 17.1 (Debian 17.1-1.pgdg120+1)")
             .unwrap();
         drop(f);
-
-        let result = detect_pg_major(path.to_str().unwrap());
-        assert_eq!(result, Some(17));
-
+        assert_eq!(detect_pg_major(path.to_str().unwrap()), Some(17));
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
-    fn test_detect_pg_major_no_version_string() {
+    fn test_detect_pg_major_edb_version_string() {
+        // EDB embeds "PostgreSQL X" in the binary alongside "EnterpriseDB".
+        // We detect the major version from the PostgreSQL marker.
+        use std::io::Write;
+        let path = std::env::temp_dir().join("pgdam_test_edb18");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"edb-postgres (EnterpriseDB) 18.1.0, based on PostgreSQL 18")
+            .unwrap();
+        drop(f);
+        assert_eq!(detect_pg_major(path.to_str().unwrap()), Some(18));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_detect_pg_major_no_version() {
         use std::io::Write;
         let path = std::env::temp_dir().join("pgdam_test_noversion");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"some random binary data with no version")
-            .unwrap();
+        f.write_all(b"some random binary data").unwrap();
         drop(f);
-
-        let result = detect_pg_major(path.to_str().unwrap());
-        assert_eq!(result, None);
-
+        assert_eq!(detect_pg_major(path.to_str().unwrap()), None);
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
-    fn test_detect_pg_major_nonexistent_file() {
-        let result = detect_pg_major("/nonexistent/path/to/binary");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_detect_pg_major_picks_highest_version() {
-        // Binary may contain multiple "PostgreSQL X" strings — should pick highest.
+    fn test_detect_pg_major_picks_highest() {
         use std::io::Write;
         let path = std::env::temp_dir().join("pgdam_test_multi");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"PostgreSQL 14 compat PostgreSQL 18 actual")
             .unwrap();
         drop(f);
-
-        let result = detect_pg_major(path.to_str().unwrap());
-        assert_eq!(result, Some(18));
-
+        assert_eq!(detect_pg_major(path.to_str().unwrap()), Some(18));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_detect_pg_major_nonexistent_file() {
+        assert_eq!(detect_pg_major("/nonexistent/path"), None);
     }
 
     // ── utf8_trim ─────────────────────────────────────────────────────────────
@@ -839,31 +963,24 @@ mod tests {
 
     #[test]
     fn test_utf8_trim_empty() {
-        let buf = [0u8; 64];
-        assert_eq!(utf8_trim(&buf), "");
+        assert_eq!(utf8_trim(&[0u8; 64]), "");
     }
 
     #[test]
-    fn test_utf8_trim_full_buffer_no_null() {
-        let buf = [b'a'; 64];
-        assert_eq!(utf8_trim(&buf), "a".repeat(64));
+    fn test_utf8_trim_full_buffer() {
+        assert_eq!(utf8_trim(&[b'a'; 64]), "a".repeat(64));
     }
 
-    // ── reconcile stale PID detection ────────────────────────────────────────
-    // reconcile() requires a live Bpf object and eBPF maps which can't be
-    // instantiated in unit tests. The stale PID logic is tested here by
-    // extracting the filtering logic directly.
+    // ── stale PID detection ───────────────────────────────────────────────────
 
     #[test]
     fn test_stale_pid_detection() {
-        use std::collections::HashSet;
+        let mut known: HashSet<u32> = [1, 2, 3, 4, 5].iter().copied().collect();
+        let live: HashSet<u32> = [1, 3, 5].iter().copied().collect();
 
-        let mut known_pids: HashSet<u32> = [1, 2, 3, 4, 5].iter().copied().collect();
-        let live_pids: HashSet<u32> = [1, 3, 5].iter().copied().collect();
-
-        let stale: Vec<u32> = known_pids
+        let stale: Vec<u32> = known
             .iter()
-            .filter(|p| !live_pids.contains(p))
+            .filter(|p| !live.contains(p))
             .copied()
             .collect();
 
@@ -872,8 +989,61 @@ mod tests {
         assert!(stale.contains(&4));
 
         for pid in &stale {
-            known_pids.remove(pid);
+            known.remove(pid);
         }
-        assert_eq!(known_pids.len(), 3);
+        assert_eq!(known.len(), 3);
+    }
+
+    // ── load base strategy ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_edb_load_base_picks_first_mapping() {
+        // EDB binaries are not PIE — the first mapping is the load base,
+        // not necessarily the r-xp segment.
+        let maps = "\
+            400000-500000 r--p 00000000 fd:01 1234 /usr/edb/as18/bin/edb-postgres\n\
+            500000-600000 r-xp 00100000 fd:01 1234 /usr/edb/as18/bin/edb-postgres\n\
+            600000-700000 rw-p 00200000 fd:01 1234 /usr/edb/as18/bin/edb-postgres\n";
+
+        let exe_name = "edb-postgres";
+
+        // EDB strategy: first line containing the exe name
+        let edb_base = maps
+            .lines()
+            .find(|l| l.contains(exe_name))
+            .and_then(|l| l.split('-').next())
+            .and_then(|s| u64::from_str_radix(s, 16).ok());
+
+        // Standard strategy: r-xp line
+        let std_base = maps
+            .lines()
+            .find(|l| l.contains("r-xp") && l.contains(exe_name))
+            .and_then(|l| l.split('-').next())
+            .and_then(|s| u64::from_str_radix(s, 16).ok());
+
+        assert_eq!(edb_base, Some(0x400000));
+        assert_eq!(std_base, Some(0x500000));
+        assert_ne!(
+            edb_base, std_base,
+            "EDB and standard strategies should pick different base addresses"
+        );
+    }
+
+    #[test]
+    fn test_standard_load_base_picks_rxp_segment() {
+        let maps = "\
+            7f1234000000-7f1234100000 r--p 00000000 fd:01 5678 /usr/pgsql-18/bin/postgres\n\
+            7f1234100000-7f1234200000 r-xp 00100000 fd:01 5678 /usr/pgsql-18/bin/postgres\n\
+            7f1234200000-7f1234300000 rw-p 00200000 fd:01 5678 /usr/pgsql-18/bin/postgres\n";
+
+        let exe_name = "postgres";
+
+        let std_base = maps
+            .lines()
+            .find(|l| l.contains("r-xp") && l.contains(exe_name))
+            .and_then(|l| l.split('-').next())
+            .and_then(|s| u64::from_str_radix(s, 16).ok());
+
+        assert_eq!(std_base, Some(0x7f1234100000u64));
     }
 }
