@@ -27,6 +27,7 @@ lazy_static = "1.4"
 axum = "0.7"
 libc = "0.2"
 once_cell = "1.21.4"
+futures = "0.3.32"
 
 [build-dependencies]
 prost-build = "0.12"

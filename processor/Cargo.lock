@@ -1592,6 +1592,7 @@ dependencies = [
  "axum",
  "chrono",
  "env_logger",
+ "futures",
  "hostname",
  "k8s-openapi",
  "kube",
