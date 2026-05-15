@@ -2,17 +2,23 @@ use crate::metrics;
 use crate::sink::Sink;
 use crate::ProcessedEvent;
 use async_trait::async_trait;
-use chrono::Utc;
 use log::error;
 use reqwest::Client;
-use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-pub struct ElasticSink {
-    client: Client,
+struct ElasticConfig {
     name: String,
     url: String,
     user: String,
     pass: String,
+}
+
+pub struct ElasticSink {
+    client: Client,
+    config: Arc<ElasticConfig>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl ElasticSink {
@@ -20,16 +26,28 @@ impl ElasticSink {
         metrics::ELASTICSEARCH_ERRORS_TOTAL
             .with_label_values(&[&name])
             .reset();
+
         metrics::SINK_LATENCY
             .with_label_values(&["elasticsearch", &name])
             .observe(0.0);
 
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|e| {
+                error!("Failed to create HTTP client: {}", e);
+                Client::new()
+            });
+
         Self {
-            client: Client::new(),
-            name,
-            url,
-            user,
-            pass,
+            client,
+            config: Arc::new(ElasticConfig {
+                name,
+                url,
+                user,
+                pass,
+            }),
+            semaphore: Arc::new(Semaphore::new(64)),
         }
     }
 }
@@ -37,74 +55,60 @@ impl ElasticSink {
 #[async_trait]
 impl Sink for ElasticSink {
     async fn send(&self, event: ProcessedEvent) {
-        let client = self.client.clone();
-        let name = self.name.clone();
-        let user = self.user.clone();
-        let pass = self.pass.clone();
-        let base_url = self.url.clone();
+        // Acquire permit BEFORE spawning. This provides backpressure to the processor loop.
+        let permit = match self.semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // Only happens if semaphore is explicitly closed
+        };
 
-        let index_name = format!("pgdam-audit-{}", Utc::now().format("%Y.%m.%d"));
-        let url = format!("{}/{}/_doc", base_url, index_name);
+        let client = self.client.clone();
+        let config = Arc::clone(&self.config);
+
+        let index_date = event
+            .timestamp
+            .parse::<i64>()
+            .ok()
+            .and_then(|nanos| {
+                let secs = nanos / 1_000_000_000;
+                let nsec_part = (nanos % 1_000_000_000) as u32;
+                chrono::DateTime::from_timestamp(secs, nsec_part)
+            })
+            .map(|dt| dt.format("%Y.%m.%d").to_string())
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y.%m.%d").to_string());
+        let url = format!("{}/pgdam-audit-{}/_doc", config.url, index_date);
 
         tokio::spawn(async move {
+            let _permit: OwnedSemaphorePermit = permit;
             let start = std::time::Instant::now();
+
             let res = client
                 .post(&url)
-                .basic_auth(&user, Some(&pass))
-                .json(&json!({
-                    "pid":               event.pid,
-                    "timestamp":         event.timestamp,
-                    "event_type":        event.event_type,
-                    "user":              event.user,
-                    "db":                event.db,
-                    "src_ip":            event.src_ip,
-                    "normalized_sql":    event.normalized_sql,
-                    "masked_sql":        event.masked_sql,
-                    "hostname":          event.hostname,
-                    "container_id":      event.container_id,
-                    "container_name":    event.container_name,
-                    "k8s_pod":           event.k8s_pod,
-                    "k8s_namespace":     event.k8s_namespace,
-                    "k8s_node":          event.k8s_node,
-                    "k8s_labels":        event.k8s_labels,
-                    "session_id":        event.session_id,
-                    "session_start":     event.session_start,
-                    "transaction_id":    event.transaction_id,
-                    "transaction_state": event.transaction_state,
-                    "query_sequence":    event.query_sequence,
-                    "truncated":         event.truncated,
-                }))
+                .basic_auth(&config.user, Some(&config.pass))
+                .json(&event)
                 .send()
                 .await;
 
             match res {
                 Ok(resp) => {
                     metrics::SINK_LATENCY
-                        .with_label_values(&["elasticsearch", &name])
+                        .with_label_values(&["elasticsearch", &config.name])
                         .observe(start.elapsed().as_secs_f64());
+
                     if !resp.status().is_success() {
                         metrics::ELASTICSEARCH_ERRORS_TOTAL
-                            .with_label_values(&[&name])
+                            .with_label_values(&[&config.name])
                             .inc();
+
                         let status = resp.status();
-                        let body = resp
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "unreadable body".to_string());
-                        error!(
-                            "[{}] Failed to sink to Elastic. Status: {}, Body: {}",
-                            name, status, body
-                        );
+                        let body = resp.text().await.unwrap_or_default();
+                        error!("[{}] Elastic error ({}): {}", config.name, status, body);
                     }
                 }
                 Err(e) => {
                     metrics::ELASTICSEARCH_ERRORS_TOTAL
-                        .with_label_values(&[&name])
+                        .with_label_values(&[&config.name])
                         .inc();
-                    error!(
-                        "[{}] Connection error while sinking to Elastic: {}",
-                        name, e
-                    );
+                    error!("[{}] Request failed for {}: {}", config.name, config.url, e);
                 }
             }
         });
