@@ -133,12 +133,9 @@ fn detect_pg_major(path: &str) -> Option<u32> {
 /// This approach handles cases where the binary version string does not
 /// contain "EnterpriseDB" (e.g. docker.enterprisedb.com/k8s/postgresql
 /// images that use EDB's Port struct layout but report as standard postgres).
-fn detect_is_edb(pid: u32, _path: &str) -> bool {
-    std::process::Command::new("nsenter")
-        .args(&["-t", &pid.to_string(), "-m", "test", "-d", "/usr/edb"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn detect_is_edb(pid: u32) -> bool {
+    let path = format!("/proc/{}/root/usr/edb", pid);
+    std::path::Path::new(&path).exists()
 }
 
 /// TODO: Verify PORT_FLAG_HOST_IS_INLINE logic
@@ -182,7 +179,7 @@ fn analyze_binary(pid: u32, path: &str) -> Option<BinaryProfile> {
     let inode = meta.ino();
     let offset = find_symbol_offset(path, "MyProcPort")?;
     let major = detect_pg_major(path).unwrap_or(18);
-    let is_edb = detect_is_edb(pid, path);
+    let is_edb = detect_is_edb(pid);
     let (off_remote_host, off_database_name, off_user_name, port_flags) =
         port_field_offsets(major, is_edb);
 
@@ -280,7 +277,7 @@ fn scan_postgres_processes() -> Vec<ProcessEntry> {
 
         // EDB binaries are not PIE — their first mapping is the load base.
         // Standard PG binaries are PIE — look specifically for the r-xp segment.
-        let is_edb = detect_is_edb(pid, &exe_link.to_string_lossy());
+        let is_edb = detect_is_edb(pid);
 
         let load_base_line = if is_edb {
             // EDB strategy: Take the very first mapping containing the exe_name
@@ -936,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_detect_is_edb_nonexistent_pid_returns_false() {
-        let result = detect_is_edb(999999999, "");
+        let result = detect_is_edb(999999999);
         assert!(!result);
     }
 
