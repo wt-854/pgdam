@@ -14,7 +14,12 @@ use std::{
     os::unix::fs::MetadataExt,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, net::UnixStream, signal};
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    signal,
+    signal::unix::{signal as unix_signal, SignalKind},
+};
 
 mod metrics;
 
@@ -22,6 +27,7 @@ const PID_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DROP_READ_INTERVAL: Duration = Duration::from_secs(10);
 const SOCKET_PATH: &str = "/tmp/pgdam.sock";
 const METRICS_PORT: u16 = 9090;
+const SHUTDOWN_DRAIN_SECS: u64 = 5;
 
 #[derive(Serialize)]
 struct AuditEventJson {
@@ -480,6 +486,86 @@ fn utf8_trim(buf: &[u8]) -> &str {
     std::str::from_utf8(buf).unwrap_or("").trim_matches('\0')
 }
 
+// ── Event processing helper ───────────────────────────────────────────────────
+
+/// Process a single SqlEvent from the ring buffer and forward it to the
+/// processor. Extracted so it can be called identically in both the main
+/// loop and the shutdown drain loop.
+async fn process_sql_event(event: &SqlEvent, processor_stream: &mut Option<UnixStream>) {
+    let sql = std::str::from_utf8(&event.payload[..event.payload_len as usize])
+        .unwrap_or("<invalid utf8>");
+
+    let incomplete = (event.flags & pgdam_common::FLAG_NO_PORT_INFO) != 0;
+    let bg_worker = (event.flags & pgdam_common::FLAG_NO_CLIENT) != 0;
+    let truncated = (event.flags & pgdam_common::FLAG_TRUNCATED) != 0;
+
+    if truncated {
+        metrics::TRUNCATED_EVENTS_TOTAL.inc();
+    }
+
+    let event_type = if incomplete {
+        "incomplete"
+    } else if bg_worker {
+        "background_worker"
+    } else {
+        "user_query"
+    }
+    .to_string();
+
+    metrics::EVENTS_CAPTURED_TOTAL.inc();
+    if incomplete {
+        metrics::INCOMPLETE_EVENTS_TOTAL.inc();
+    }
+    if bg_worker {
+        metrics::BG_WORKER_EVENTS_TOTAL.inc();
+    }
+
+    let user = utf8_trim(&event.user_name);
+    let db = utf8_trim(&event.database_name);
+    let src_ip = utf8_trim(&event.remote_host);
+
+    if incomplete {
+        warn!(
+            "Incomplete event PID {}: sql=\"{}\" \
+             (PID_INFO race — context unavailable, event will not be replayed)",
+            event.pid,
+            sql.trim()
+        );
+    } else {
+        info!(
+            "pid={} type={} user={} db={} src={} truncated={} sql=\"{}\"",
+            event.pid,
+            event_type,
+            user,
+            db,
+            src_ip,
+            truncated,
+            sql.trim()
+        );
+    }
+
+    let audit = AuditEventJson {
+        pid: event.pid,
+        timestamp: event.timestamp,
+        event_type,
+        raw_sql: sql.to_string(),
+        user: user.to_string(),
+        db: db.to_string(),
+        src_ip: src_ip.to_string(),
+        incomplete,
+        truncated,
+    };
+
+    if let Some(ref mut stream) = processor_stream {
+        if let Ok(payload) = serde_json::to_vec(&audit) {
+            if !send_event(stream, &payload).await {
+                error!("Lost processor connection. Reconnecting...");
+                *processor_stream = connect_to_processor().await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::init();
@@ -489,6 +575,12 @@ async fn main() -> Result<(), anyhow::Error> {
     tokio::spawn(metrics::start_metrics_server(METRICS_PORT));
 
     metrics::init_metrics();
+
+    // ── Install signal handlers before doing any real work ────────────────────
+    // Both handlers must be installed before the event loop; re-creating them
+    // inside the loop would miss signals delivered between iterations.
+    let mut sigterm =
+        unix_signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     let bpf_bytes = include_bytes_aligned!("../../target/bpfel-unknown-none/release/pgdam-ebpf");
     let mut bpf = Bpf::load(bpf_bytes)?;
@@ -565,45 +657,63 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut last_drop_read = tokio::time::Instant::now();
     let mut last_drop_count: u32 = 0;
 
+    // ── Shutdown state ────────────────────────────────────────────────────────
+    // When a signal arrives we set shutting_down = true and stop accepting new
+    // work (fork fast-path, reconciliation, drop counter reads) while continuing
+    // to drain whatever remains in the eBPF ring buffer.  The drain runs until
+    // the buffer is empty or the deadline expires, whichever comes first.
+    let mut shutting_down = false;
+    let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+
     // ── Event loop ────────────────────────────────────────────────────────────
     loop {
-        // -- Fork fast-path ─────────────────────────────────────────────────
-        // The fork tracepoint fires in kernel context and immediately writes
-        // child PIDs here.  Processing them now (before the next reconcile
-        // tick) minimises the window where a forked worker fires pg_parse_query
-        // before its PID_INFO entry exists.
-        while let Some(item) = new_pids_buf.next() {
-            let child_pid = unsafe { *(item.as_ptr() as *const u32) };
-            if known_pids.contains(&child_pid) {
-                continue;
+        // ── Shutdown deadline check ───────────────────────────────────────────
+        if let Some(deadline) = shutdown_deadline {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "Shutdown drain deadline ({}s) exceeded — some in-flight \
+                     events may have been lost.",
+                    SHUTDOWN_DRAIN_SECS
+                );
+                break;
             }
+        }
 
-            // The child inherits its parent's binary image; its inode is
-            // already in known_binaries.  We just need to write PID_INFO.
-            // /proc/<child>/maps may not be populated yet immediately after
-            // fork — scan_postgres_processes() returns None in that case, and
-            // reconcile() will catch it on the next tick.
-            if let Some(proc) = scan_postgres_processes()
-                .into_iter()
-                .find(|p| p.pid == child_pid)
-            {
-                match push_pid_info(&mut pid_info_map, &proc) {
-                    Ok(_) => {
-                        let _ = watched_parents.insert(child_pid, 1u8, 0);
-                        known_pids.insert(child_pid);
-                        info!(
-                            "Fork-registered PID {} (inode={} base=0x{:x})",
-                            child_pid, proc.inode, proc.load_base
-                        );
+        // ── Fork fast-path (skip during shutdown) ─────────────────────────────
+        if !shutting_down {
+            while let Some(item) = new_pids_buf.next() {
+                let child_pid = unsafe { *(item.as_ptr() as *const u32) };
+                if known_pids.contains(&child_pid) {
+                    continue;
+                }
+
+                // The child inherits its parent's binary image; its inode is
+                // already in known_binaries.  We just need to write PID_INFO.
+                // /proc/<child>/maps may not be populated yet immediately after
+                // fork — scan_postgres_processes() returns None in that case, and
+                // reconcile() will catch it on the next tick.
+                if let Some(proc) = scan_postgres_processes()
+                    .into_iter()
+                    .find(|p| p.pid == child_pid)
+                {
+                    match push_pid_info(&mut pid_info_map, &proc) {
+                        Ok(_) => {
+                            let _ = watched_parents.insert(child_pid, 1u8, 0);
+                            known_pids.insert(child_pid);
+                            info!(
+                                "Fork-registered PID {} (inode={} base=0x{:x})",
+                                child_pid, proc.inode, proc.load_base
+                            );
+                        }
+                        Err(e) => error!("Fork-register PID {}: {}", child_pid, e),
                     }
-                    Err(e) => error!("Fork-register PID {}: {}", child_pid, e),
                 }
             }
             // If /proc/<child> isn't ready yet, reconcile() picks it up.
         }
 
-        // ── Periodic reconciliation ───────────────────────────────────────────
-        if last_refresh.elapsed() >= PID_REFRESH_INTERVAL {
+        // ── Periodic reconciliation (skip during shutdown) ────────────────────
+        if !shutting_down && last_refresh.elapsed() >= PID_REFRESH_INTERVAL {
             match reconcile(
                 &mut bpf,
                 &mut binary_configs,
@@ -651,8 +761,8 @@ async fn main() -> Result<(), anyhow::Error> {
             last_refresh = tokio::time::Instant::now();
         }
 
-        // ── Periodic drop counter read ────────────────────────────────────────
-        if last_drop_read.elapsed() >= DROP_READ_INTERVAL {
+        // ── Periodic drop counter read (skip during shutdown) ─────────────────
+        if !shutting_down && last_drop_read.elapsed() >= DROP_READ_INTERVAL {
             if let Ok(current) = drop_map.get(&0, 0) {
                 if current > last_drop_count {
                     let delta = current - last_drop_count;
@@ -673,85 +783,36 @@ async fn main() -> Result<(), anyhow::Error> {
         // ── SQL event processing ──────────────────────────────────────────────
         if let Some(item) = ring_buf.next() {
             let event = unsafe { &*(item.as_ptr() as *const SqlEvent) };
-
-            let sql = std::str::from_utf8(&event.payload[..event.payload_len as usize])
-                .unwrap_or("<invalid utf8>");
-
-            let incomplete = (event.flags & pgdam_common::FLAG_NO_PORT_INFO) != 0;
-            let bg_worker = (event.flags & pgdam_common::FLAG_NO_CLIENT) != 0;
-            let truncated = (event.flags & pgdam_common::FLAG_TRUNCATED) != 0;
-
-            if truncated {
-                metrics::TRUNCATED_EVENTS_TOTAL.inc();
-            }
-
-            let event_type = if incomplete {
-                "incomplete"
-            } else if bg_worker {
-                "background_worker"
-            } else {
-                "user_query"
-            }
-            .to_string();
-
-            metrics::EVENTS_CAPTURED_TOTAL.inc();
-            if incomplete {
-                metrics::INCOMPLETE_EVENTS_TOTAL.inc();
-            }
-            if bg_worker {
-                metrics::BG_WORKER_EVENTS_TOTAL.inc();
-            }
-
-            let user = utf8_trim(&event.user_name);
-            let db = utf8_trim(&event.database_name);
-            let src_ip = utf8_trim(&event.remote_host);
-
-            if incomplete {
-                warn!(
-                    "Incomplete event PID {}: sql=\"{}\" \
-                     (PID_INFO race — context unavailable, event will not be replayed)",
-                    event.pid,
-                    sql.trim()
-                );
-            } else {
-                info!(
-                    "pid={} type={} user={} db={} src={} truncated={} sql=\"{}\"",
-                    event.pid,
-                    event_type,
-                    user,
-                    db,
-                    src_ip,
-                    truncated,
-                    sql.trim()
-                );
-            }
-
-            let audit = AuditEventJson {
-                pid: event.pid,
-                timestamp: event.timestamp,
-                event_type,
-                raw_sql: sql.to_string(),
-                user: user.to_string(),
-                db: db.to_string(),
-                src_ip: src_ip.to_string(),
-                incomplete,
-                truncated,
-            };
-
-            if let Some(ref mut stream) = processor_stream {
-                if let Ok(payload) = serde_json::to_vec(&audit) {
-                    if !send_event(stream, &payload).await {
-                        error!("Lost processor connection. Reconnecting...");
-                        processor_stream = connect_to_processor().await;
-                    }
-                }
-            }
+            process_sql_event(event, &mut processor_stream).await;
         } else {
-            // Ring buffer is empty — yield to the runtime or handle Ctrl-C.
+            // Ring buffer is empty.
+            if shutting_down {
+                // Buffer confirmed empty — clean exit.
+                info!("Ring buffer drained. Shutdown complete.");
+                break;
+            }
+
+            // Normal idle: wait for either a signal or the next poll tick.
             tokio::select! {
                 _ = signal::ctrl_c() => {
-                    info!("Shutting down.");
-                    break;
+                    info!(
+                        "SIGINT received — draining ring buffer (max {}s)...",
+                        SHUTDOWN_DRAIN_SECS
+                    );
+                    shutting_down = true;
+                    shutdown_deadline = Some(
+                        tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_DRAIN_SECS)
+                    );
+                }
+                _ = sigterm.recv() => {
+                    info!(
+                        "SIGTERM received — draining ring buffer (max {}s)...",
+                        SHUTDOWN_DRAIN_SECS
+                    );
+                    shutting_down = true;
+                    shutdown_deadline = Some(
+                        tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_DRAIN_SECS)
+                    );
                 }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
@@ -822,7 +883,6 @@ mod tests {
     fn test_edb17_offsets() {
         let (host, db, user, flags) = port_field_offsets(17, true);
         assert_eq!((host, db, user), (288, 320, 328));
-        // EDB uses all pointer fields — no inline flag
         assert_eq!(flags, 0);
     }
 
@@ -842,14 +902,11 @@ mod tests {
 
     #[test]
     fn test_edb_and_pg17_offsets_match() {
-        // EDB17 and standard PG17 happen to have the same offsets.
-        // This is expected — verify it explicitly so any future drift is caught.
         let pg17 = port_field_offsets(17, false);
         let edb17 = port_field_offsets(17, true);
         assert_eq!(pg17.0, edb17.0, "remote_host offset should match");
         assert_eq!(pg17.1, edb17.1, "database_name offset should match");
         assert_eq!(pg17.2, edb17.2, "user_name offset should match");
-        // port_flags differ: PG17 has no inline flag, EDB17 has no inline flag — both 0
         assert_eq!(pg17.3, edb17.3);
     }
 
@@ -879,7 +936,6 @@ mod tests {
 
     #[test]
     fn test_detect_is_edb_nonexistent_pid_returns_false() {
-        // PID 999999999 does not exist, nsenter will fail, should return false.
         let result = detect_is_edb(999999999, "");
         assert!(!result);
     }
@@ -912,8 +968,6 @@ mod tests {
 
     #[test]
     fn test_detect_pg_major_edb_version_string() {
-        // EDB embeds "PostgreSQL X" in the binary alongside "EnterpriseDB".
-        // We detect the major version from the PostgreSQL marker.
         use std::io::Write;
         let path = std::env::temp_dir().join("pgdam_test_edb18");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -1007,14 +1061,12 @@ mod tests {
 
         let exe_name = "edb-postgres";
 
-        // EDB strategy: first line containing the exe name
         let edb_base = maps
             .lines()
             .find(|l| l.contains(exe_name))
             .and_then(|l| l.split('-').next())
             .and_then(|s| u64::from_str_radix(s, 16).ok());
 
-        // Standard strategy: r-xp line
         let std_base = maps
             .lines()
             .find(|l| l.contains("r-xp") && l.contains(exe_name))
