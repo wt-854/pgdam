@@ -17,6 +17,7 @@ object = "0.32"
 prometheus = "0.13"
 lazy_static = "1.4"
 axum = "0.7"
+libc = "0.2"
 
 [[bin]]
 name = "pgdam-agent"

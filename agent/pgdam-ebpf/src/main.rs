@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_pid_tgid, bpf_ktime_get_tai_ns, bpf_probe_read_user,
+        bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user,
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint, uprobe},
@@ -100,7 +100,7 @@ fn try_pg_parse_query(ctx: ProbeContext) -> Result<u32, i64> {
     unsafe {
         (*ep).pid = pid;
         (*ep).flags = 0;
-        (*ep).timestamp = bpf_ktime_get_tai_ns();
+        (*ep).timestamp = bpf_ktime_get_ns();
 
         let bytes_read = match bpf_probe_read_user_str_bytes(query_ptr, &mut (*ep).payload) {
             Ok(b) => b.len() as u32,

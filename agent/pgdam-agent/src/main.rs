@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap as StdHashMap, HashSet},
     convert::TryFrom,
     os::unix::fs::MetadataExt,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -71,6 +71,25 @@ struct ProcessEntry {
     load_base: u64,
     /// Matches BinaryProfile.inode for the binary this process runs.
     inode: u64,
+}
+/// Function to calculate timestamp accurately
+fn boot_to_wall_offset_ns() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid pointer, standard syscall
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    let monotonic_ns = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+
+    let realtime_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    realtime_ns - monotonic_ns
 }
 
 // ── ELF analysis ─────────────────────────────────────────────────────────────
@@ -488,7 +507,11 @@ fn utf8_trim(buf: &[u8]) -> &str {
 /// Process a single SqlEvent from the ring buffer and forward it to the
 /// processor. Extracted so it can be called identically in both the main
 /// loop and the shutdown drain loop.
-async fn process_sql_event(event: &SqlEvent, processor_stream: &mut Option<UnixStream>) {
+async fn process_sql_event(
+    event: &SqlEvent,
+    processor_stream: &mut Option<UnixStream>,
+    wall_offset_ns: i64,
+) {
     let sql = std::str::from_utf8(&event.payload[..event.payload_len as usize])
         .unwrap_or("<invalid utf8>");
 
@@ -543,7 +566,7 @@ async fn process_sql_event(event: &SqlEvent, processor_stream: &mut Option<UnixS
 
     let audit = AuditEventJson {
         pid: event.pid,
-        timestamp: event.timestamp,
+        timestamp: (event.timestamp as i64 + wall_offset_ns) as u64,
         event_type,
         raw_sql: sql.to_string(),
         user: user.to_string(),
@@ -567,6 +590,9 @@ async fn process_sql_event(event: &SqlEvent, processor_stream: &mut Option<UnixS
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::init();
     info!("Starting pgdam-agent (multi-binary mode)...");
+
+    let wall_offset_ns: i64 = boot_to_wall_offset_ns();
+    info!("Boot-to-wall offset: {}ns", wall_offset_ns);
 
     // Start metrics server in background.
     tokio::spawn(metrics::start_metrics_server(METRICS_PORT));
@@ -780,7 +806,7 @@ async fn main() -> Result<(), anyhow::Error> {
         // ── SQL event processing ──────────────────────────────────────────────
         if let Some(item) = ring_buf.next() {
             let event = unsafe { &*(item.as_ptr() as *const SqlEvent) };
-            process_sql_event(event, &mut processor_stream).await;
+            process_sql_event(event, &mut processor_stream, wall_offset_ns).await;
         } else {
             // Ring buffer is empty.
             if shutting_down {
