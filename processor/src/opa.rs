@@ -43,7 +43,7 @@ struct KillResponse {
     result: bool,
 }
 
-const OPA_MASK_URL: &str = "http://127.0.0.1:8181/v1/data/pgdam/masking/mask_field";
+const OPA_MASK_URL: &str = "http://127.0.0.1:8181/v1/data/pgdam/mask/mask_field";
 const OPA_KILL_URL: &str = "http://127.0.0.1:8181/v1/data/pgdam/kill/should_kill";
 const OPA_MAX_RETRY: u32 = 3;
 const OPA_RETRY_MS: u64 = 500;
