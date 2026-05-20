@@ -1,13 +1,13 @@
 # PostgreSQL Database Activity Monitoring (pgDAM)
 
-A high-performance PostgreSQL Database Activity Monitoring (DAM) system using eBPF for zero-overhead SQL capture and Open Policy Agent (OPA) for dynamic PII masking.
+A high-performance PostgreSQL Database Activity Monitoring (DAM) system using eBPF for zero-overhead SQL capture, Open Policy Agent (OPA) for PII masking and SQL injection detection, and a Rust processor for enrichment and routing to audit sinks.
 
 ## Architecture
 
 The system is deployed as a Kubernetes DaemonSet with three containers per pod:
-1. **Agent (Rust/eBPF)**: Captures PostgreSQL network traffic using eBPF uprobes/kprobes and streams events to the Processor.
-2. **Processor (Rust)**: Normalizes raw SQL, extracts potential PII, and queries OPA for masking decisions.
-3. **OPA (Open Policy Agent)**: Evaluates Rego policies to determine which data points should be redacted.
+1. **Agent (Rust/eBPF)**: Captures PostgreSQL network traffic using eBPF uprobes and streams events to the Processor.
+2. **Processor (Rust)**: Normalizes raw SQL, extracts potential PII, queries OPA for masking and kill decisions, tracks sessions and transactions, enriches events with Kubernetes metadata, and routes to configured sinks.
+3. **OPA (Open Policy Agent)**: Evaluates Rego policies to determine which data points should be redacted and whether a session should be terminated.
 
 ```mermaid
 graph TB
@@ -44,6 +44,99 @@ graph TB
     style OPA fill:#dfd,stroke:#333,stroke-width:2px
     style SharedVol fill:#eee,stroke:#333,stroke-dasharray: 5 5
 ```
+
+## Supported PostgreSQL Versions
+
+| Version | Standard | EDB Advanced Server |
+|---------|----------|---------------------|
+| 14      | ✓        | —                   |
+| 15      | ✓        | —                   |
+| 16      | ✓        | —                   |
+| 17      | ✓        | ✓                   |
+| 18      | ✓        | ✓                   |
+
+The agent detects each PostgreSQL binary's version automatically by scanning the binary on disk. Multiple PostgreSQL instances — different versions, different containers — are monitored simultaneously on the same node.
+
+## Event Schema
+
+Every captured query produces a document with the following fields:
+
+| Field | Description |
+|-------|-------------|
+| `pid` | PostgreSQL backend process ID |
+| `timestamp` | Capture time (nanoseconds since epoch) |
+| `event_type` | `user_query`, `background_worker`, or `incomplete` |
+| `user` | PostgreSQL username |
+| `db` | Database name |
+| `src_ip` | Client IP address |
+| `raw_sql` | Original unmodified SQL |
+| `normalized_sql` | SQL with literals replaced by `$1, $2, ...` |
+| `masked_sql` | SQL with PII replaced by `<REDACTED>` |
+| `hostname` | Node hostname |
+| `container_id` | Container ID (if running in a container) |
+| `container_name` | Container name |
+| `k8s_pod` | Kubernetes pod name |
+| `k8s_namespace` | Kubernetes namespace |
+| `k8s_node` | Kubernetes node name |
+| `k8s_labels` | Pod labels as key-value pairs |
+| `session_id` | UUID stable for the lifetime of a PostgreSQL backend connection |
+| `session_start` | Timestamp of the first query seen from this session |
+| `transaction_id` | UUID for the current transaction (empty outside a transaction) |
+| `transaction_state` | `autocommit`, `open`, `committed`, or `rolled_back` |
+| `query_sequence` | Monotonically increasing counter within a session |
+| `truncated` | `true` if the SQL exceeded the 512-byte capture buffer |
+| `kill_triggered` | `true` if the kill policy fired for this query |
+
+## Kill Mode
+
+The processor supports three kill modes, configured via `config.yaml`:
+
+| Mode | Behaviour |
+|------|-----------|
+| `disabled` | Kill policy is never evaluated. Default. |
+| `manual` | Policy is evaluated. Flagged queries set `kill_triggered = true` in the audit log but no action is taken. |
+| `auto` | Policy is evaluated. Flagged queries result in `SIGTERM` being sent to the PostgreSQL backend process. |
+
+Kill decisions are made by OPA using the `pgdam.kill` policy. Out of the box the policy detects UNION-based injection, boolean injection, stacked queries, privilege escalation (`ALTER ROLE ... SUPERUSER`), and `pg_shadow` access. Trusted source IPs and trusted users are whitelisted and never killed.
+
+## Processor Configuration
+
+The processor is configured via a YAML file mounted at `/etc/pgdam/config.yaml` (override with `PGDAM_CONFIG` env var).
+
+```yaml
+kill_mode: manual  # disabled (default) | manual | auto
+
+sinks:
+  elasticsearch:
+    enabled: true
+    instances:
+      - name: prod
+        enabled: true
+        url: http://elasticsearch.pgdam.svc.cluster.local:9200
+        credentials:
+          username_env: ELASTIC_USER
+          password_env: ELASTIC_PASS
+
+  kafka:
+    enabled: true
+    instances:
+      - name: prod
+        enabled: true
+        brokers:
+          - kafka:9092
+        auth:
+          mechanism: sasl_plain   # none | sasl_plain | sasl_scram256 | sasl_scram512 | mtls
+          username_env: KAFKA_USER
+          password_env: KAFKA_PASS
+        topics:
+          user_query:
+            - pgdam.user-queries
+          background_worker:
+            - pgdam.bg-workers
+```
+
+Credentials are never stored in the config file — they are resolved from environment variables at runtime.
+
 
 ## Prerequisites
 
@@ -126,6 +219,7 @@ Apply the RBAC configurations, OPA Rego policies, and deploy the DaemonSet.
 ```bash
 kubectl apply -f deploy/rbac.yaml
 kubectl apply -f deploy/configs.yaml
+kubectl apply -f deploy/pgdam-config.yaml
 kubectl apply -f deploy/daemonset.yaml
 ```
 
@@ -184,6 +278,63 @@ kubectl logs daemonset/pgdam-agent -n pgdam -c processor --tail=10
 ```bash
 curl -s -u elastic:pgdam-elastic-pass \
   -X GET "localhost:9200/pgdam-audit-*/_search?pretty"
+```
+
+## Metrics
+
+Both the agent and processor expose Prometheus metrics:
+
+| Endpoint | Port | Container |
+|----------|------|-----------|
+| `http://<node>:9090/metrics` | 9090 | agent |
+| `http://<node>:9091/metrics` | 9091 | processor |
+
+Key agent metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `pgdam_events_captured_total` | Total SQL events captured |
+| `pgdam_events_dropped_total` | Events lost due to ring buffer overflow |
+| `pgdam_truncated_events_total` | Events where SQL exceeded 512-byte buffer |
+| `pgdam_pid_map_size` | Active PostgreSQL backends being monitored |
+| `pgdam_binary_count` | Unique PostgreSQL binaries with active uprobes |
+
+Key processor metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `pgdam_events_processed_total` | Events processed, by type |
+| `pgdam_opa_latency_seconds` | OPA masking call latency |
+| `pgdam_enrichment_latency_seconds` | K8s pod store scan latency |
+| `pgdam_session_store_size` | Active sessions in the session store |
+| `pgdam_kafka_errors_total` | Kafka produce errors, by instance and topic |
+| `pgdam_elasticsearch_errors_total` | Elasticsearch indexing errors, by instance |
+
+## Running Tests
+
+### Unit tests
+
+```bash
+# Agent
+cargo test --manifest-path agent/Cargo.toml -p pgdam-agent
+
+# Processor
+cargo test --manifest-path processor/Cargo.toml -p pgdam-processor
+```
+
+### E2E tests
+
+Requires a running cluster with Elasticsearch and PostgreSQL port-forwarded.
+
+```bash
+kubectl port-forward service/elasticsearch 9200:9200 -n pgdam &
+kubectl port-forward service/postgres 5432:5432 &
+
+cd tests/e2e/
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pytest test_pgdam.py -v
 ```
 
 ## Repository Structure
